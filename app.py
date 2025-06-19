@@ -4,68 +4,166 @@ import json
 import os
 import pandas as pd
 import io
-from datetime import datetime
 import numpy as np
 import time
-import math
+from datetime import datetime
+import hashlib
+import urllib.parse
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+import threading
+import logging
 
-# ==============================
-# CONFIGURACIÓN INICIAL Y ESTILO
-# ==============================
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("inventarios-app")
 
 st.set_page_config(layout="wide", page_title="Gestión de Inventario ESPAITEC")
 
-COLOR_NARANJA = "#F39200"
-COLOR_NEGRO = "#1D1D1B"
-COLOR_GRIS = "#f4f4f4"
-
-st.markdown(f"""
+# ---- CUSTOM STYLES ----
+st.markdown("""
     <style>
-        .main .block-container {{
-            padding-top: 2rem;
-        }}
-        html, body, [class*="css"]  {{
-            font-family: Helvetica, Arial, sans-serif !important;
-        }}
-        .stButton>button {{
-            background-color: {COLOR_NARANJA};
-            color: white;
-            border-radius:8px;
-            font-weight:bold;
-            border:none;
-            transition: background-color 0.3s ease;
-        }}
-        .stButton>button:hover {{
-            background-color: #e97d00;
-            color: white;
-        }}
-        .stMetric {{
-            background-color: #FFFFFF;
-            border: 1px solid #E0E0E0;
-            border-radius: 10px;
-            padding: 15px;
-        }}
+    .main .block-container {padding: 0;}
+    div[data-testid="stHeader"], div[data-testid="stFooter"] {display: none;}
+    .user-info {text-align: right;}
+    .sidebar-title {color:#F39200;font-size:1.3em;font-weight:bold;}
+    .sidebar-logo {margin:0 0 1.5em 0;display:block;}
     </style>
 """, unsafe_allow_html=True)
 
-# ==============================
-# FUNCIONES CORE
-# ==============================
+# ---- SESSION & LOGIN ----
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "user_email" not in st.session_state:
+    st.session_state.user_email = ""
+if "user_name" not in st.session_state:
+    st.session_state.user_name = ""
+if "access_token" not in st.session_state:
+    st.session_state.access_token = None
+if "state" not in st.session_state:
+    st.session_state.state = hashlib.sha256(os.urandom(1024)).hexdigest()
 
-# --- Interacción con API de Mercado Libre ---
+def is_valid_email(email):
+    return email and "@espaitec.mx" in email
+
+def logout():
+    keys_to_keep = ['authenticated', 'user_email', 'user_name', 'access_token', 'state']
+    for key in list(st.session_state.keys()):
+        if key not in keys_to_keep:
+            del st.session_state[key]
+    st.session_state.authenticated = False
+    st.session_state.user_email = ""
+    st.session_state.user_name = ""
+    st.session_state.access_token = None
+    st.rerun()
+
+def get_user_info(credentials):
+    try:
+        service = build('oauth2', 'v2', credentials=credentials)
+        return service.userinfo().get().execute()
+    except Exception as e:
+        st.error(f"Error usuario: {str(e)}")
+        return None
+
+def handle_oauth_callback():
+    """Maneja el callback de Google OAuth para autenticar al usuario."""
+    try:
+        code = st.query_params.get("code")
+        if not code:
+            return False
+
+        client_config = {
+            "web": {
+                "client_id": st.secrets["google_oauth"]["client_id"],
+                "client_secret": st.secrets["google_oauth"]["client_secret"],
+                "redirect_uris": [st.secrets["google_oauth"]["redirect_uri"]],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token"
+            }
+        }
+        
+        flow = Flow.from_client_config(
+            client_config,
+            scopes=["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"],
+            redirect_uri=st.secrets["google_oauth"]["redirect_uri"]
+        )
+        
+        flow.fetch_token(code=code)
+        credentials = flow.credentials
+        st.session_state.access_token = credentials.token
+        
+        user_info = get_user_info(credentials)
+        if user_info and "email" in user_info:
+            email = user_info["email"]
+            if is_valid_email(email):
+                st.session_state.authenticated = True
+                st.session_state.user_email = email
+                st.session_state.user_name = user_info.get("name", email.split("@")[0])
+                # Generar y guardar token de sesión
+                st.session_state.session_token = hashlib.sha256(os.urandom(1024)).hexdigest()
+                st.query_params["session_token"] = st.session_state.session_token
+                return True
+            else:
+                st.error(f"Acceso denegado. El correo {email} no pertenece al dominio @espaitec.mx")
+                return False
+        else:
+            st.error("No se pudo obtener el correo electrónico del usuario.")
+            return False
+    
+    except Exception as e:
+        st.error(f"Error en la autenticación: {str(e)}")
+        return False
+
+def get_google_auth_url():
+    return (
+        "https://accounts.google.com/o/oauth2/auth"
+        f"?client_id={st.secrets['google_oauth']['client_id']}"
+        f"&redirect_uri={urllib.parse.quote(st.secrets['google_oauth']['redirect_uri'])}"
+        f"&scope={urllib.parse.quote('openid email profile')}"
+        "&response_type=code"
+        f"&state={st.session_state.state}"
+        "&access_type=offline"
+        "&prompt=consent"
+    )
+
+# ---- FILE HISTORY ----
+def manage_file_history(directory, file_extension, max_files=3):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    
+    history = sorted(
+        [os.path.join(directory, f) for f in os.listdir(directory) if f.endswith(file_extension)],
+        key=os.path.getmtime
+    )
+    
+    while len(history) >= max_files:
+        os.remove(history.pop(0))
+
+# ---- API MERCADO LIBRE ----
 def get_headers(token):
+    """Genera los headers de autorización para la API de Mercado Libre."""
     return {"Authorization": f"Bearer {token}"}
 
 def get_user_id(token):
+    """Obtiene el ID del usuario autenticado en Mercado Libre."""
     url = "https://api.mercadolibre.com/users/me"
     try:
         resp = requests.get(url, headers=get_headers(token), timeout=10)
         resp.raise_for_status()
         return resp.json()["id"]
-    except requests.RequestException:
+    except requests.RequestException as e:
+        logger.error(f"Error al obtener user_id: {str(e)}")
         return None
 
 def get_items(user_id, token, status):
+    """Obtiene todos los items de un usuario con un status específico (active, paused, etc)."""
     items = []
     offset = 0
     limit = 50
@@ -80,39 +178,76 @@ def get_items(user_id, token, status):
             if not results or len(results) < limit:
                 break
             offset += limit
-        except requests.RequestException:
+        except requests.RequestException as e:
+            logger.error(f"Error al obtener items con status {status}: {str(e)}")
             break
     return items
 
 def get_item_detail(item_id, token):
+    """Obtiene los detalles completos de un item específico."""
     url = f"https://api.mercadolibre.com/items/{item_id}"
     try:
         resp = requests.get(url, headers=get_headers(token), timeout=10)
         resp.raise_for_status()
         return resp.json()
-    except requests.RequestException:
+    except requests.RequestException as e:
+        logger.error(f"Error al obtener detalles del item {item_id}: {str(e)}")
         return None
 
-def update_item_stock(item_id, payload, token):
+def extract_sku_from_item(item_or_variation):
+    """Extrae el SKU de un item o variación buscando en múltiples campos posibles."""
+    # Primero intentar obtener el SKU del campo principal
+    sku = item_or_variation.get("seller_custom_field", "")
+    
+    # Si no hay SKU en seller_custom_field, intentar obtenerlo de attribute_combinations
+    if not sku:
+        attr_field = "attribute_combinations" if "attribute_combinations" in item_or_variation else "attributes"
+        if attr_field in item_or_variation:
+            for attr in item_or_variation[attr_field]:
+                if attr.get("id") == "SELLER_SKU":
+                    sku = attr.get("value_name", "")
+                    break
+    
+    # Si aún no hay SKU, intentar obtenerlo del campo SKU directo
+    if not sku:
+        sku = item_or_variation.get("sku", "")
+        
+    return sku
+
+def update_item_stock_safe(item_id, all_variations, token):
+    """Actualiza el stock de un item asegurando que se envíen TODAS las variantes para evitar eliminaciones."""
     url = f"https://api.mercadolibre.com/items/{item_id}"
     headers = get_headers(token)
     headers["Content-Type"] = "application/json"
     headers["Accept"] = "application/json"
     
     try:
-        for attempt in range(3):
-            resp = requests.put(url, data=json.dumps(payload), headers=headers, timeout=15)
+        # Primer intento
+        resp = requests.put(url, data=json.dumps(all_variations), headers=headers, timeout=15)
+        if resp.status_code == 200:
+            logger.info(f"Item {item_id} actualizado correctamente")
+            return {"success": True, "data": resp.json()}
+            
+        # Si hay rate limiting, esperar y reintentar
+        if resp.status_code == 429:
+            logger.warning(f"Rate limit alcanzado para {item_id}, reintentando después de pausa")
+            time.sleep(2)
+            resp = requests.put(url, data=json.dumps(all_variations), headers=headers, timeout=15)
             if resp.status_code == 200:
+                logger.info(f"Item {item_id} actualizado correctamente en segundo intento")
                 return {"success": True, "data": resp.json()}
-            if resp.status_code == 429:
-                time.sleep((attempt + 1) * 2)
-                continue
-            resp.raise_for_status()
-        return {"success": False, "error": f"El servidor respondió con estatus {resp.status_code}", "details": resp.text}
+                
+        # Si sigue fallando, registrar el error
+        error_msg = f"Status {resp.status_code}"
+        logger.error(f"Error al actualizar {item_id}: {error_msg} - {resp.text}")
+        return {"success": False, "error": error_msg, "details": resp.text}
+        
     except requests.RequestException as e:
+        logger.error(f"Excepción al actualizar {item_id}: {str(e)}")
         return {"success": False, "error": str(e), "details": ""}
 
 def pause_item(item_id, token):
+    """Pausa una publicación en Mercado Libre (cuando su stock total es 0)."""
     url = f"https://api.mercadolibre.com/items/{item_id}"
     headers = get_headers(token)
     headers["Content-Type"] = "application/json"
@@ -122,351 +257,437 @@ def pause_item(item_id, token):
     try:
         resp = requests.put(url, data=json.dumps(payload), headers=headers, timeout=10)
         resp.raise_for_status()
+        logger.info(f"Item {item_id} pausado correctamente")
         return {"success": True}
     except requests.RequestException as e:
+        logger.error(f"Error al pausar item {item_id}: {str(e)}")
         return {"success": False, "error": str(e)}
 
-# --- Manejo de Archivos Locales ---
-import os
-
-def load_token():
-    access_token = os.getenv("ML_ACCESS_TOKEN")
-    if access_token:
-        return {"access_token": access_token}
-    return None
-
-def guardar_inventario_local(df):
-    script_dir = os.path.dirname(__file__)
-    inv_path = os.path.join(script_dir, "inventario_ml.xlsx")
-    fecha_path = os.path.join(script_dir, "inventario_ml.fecha.txt")
-    
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False)
-    with open(inv_path, "wb") as f:
-        f.write(output.getvalue())
-    with open(fecha_path, "w") as f:
-        f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    st.session_state.df_inv = df
-    st.session_state.fecha_inv = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-def cargar_inventario_local():
-    script_dir = os.path.dirname(__file__)
-    inv_path = os.path.join(script_dir, "inventario_ml.xlsx")
-    fecha_path = os.path.join(script_dir, "inventario_ml.fecha.txt")
-
-    if 'df_inv' not in st.session_state:
-        if os.path.exists(inv_path):
-            st.session_state.df_inv = pd.read_excel(inv_path)
-            if os.path.exists(fecha_path):
-                with open(fecha_path) as f:
-                    st.session_state.fecha_inv = f.read().strip()
-            else:
-                st.session_state.fecha_inv = "Fecha desconocida"
-        else:
-            st.session_state.df_inv = None
-            st.session_state.fecha_inv = None
-
-# ==============================
-# INICIALIZACIÓN DE SESSION STATE
-# ==============================
-
-if 'results' not in st.session_state:
-    st.session_state.results = None
-
-cargar_inventario_local()
-
-# ==============================
-# INTERFAZ DE USUARIO (UI)
-# ==============================
-
-# --- Encabezado ---
-st.markdown(
-    f"""
-    <div style="display:flex;align-items:center;margin-bottom:1.2em;">
-      <img src="https://cdn.shopify.com/s/files/1/0603/0016/5294/files/logo-1.png?v=1750307988" width="80" style="margin-right:18px;border-radius:16px;">
-      <div>
-        <h1 style="color:{COLOR_NARANJA};margin-bottom:0px;font-family:Helvetica;">Gestión de Inventario Mercado Libre</h1>
-        <div style="color:{COLOR_NEGRO};font-size:1.12em;">Plataforma oficial para actualizar stock <b>masivo y seguro</b> de <b>ESPAITEC Tactical & Outdoors</b>.</div>
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-# --- Verificación de Token ---
-token_data = load_token()
-if not token_data:
-    st.error("🔴 **Error de Autenticación:** No se encontró el archivo `ml_token.json`. Por favor, asegúrate de que el archivo de token esté en la misma carpeta que la aplicación.")
+# ---- LOGIN UI ----
+if "session_token" in st.query_params and "session_token" in st.session_state:
+    if st.query_params["session_token"] == st.session_state.session_token:
+        st.session_state.authenticated = True
+    else:
+        st.session_state.authenticated = False
+        st.error("Token de sesión inválido.")
+        
+if not st.session_state.authenticated:
+    if "code" in st.query_params:
+        if handle_oauth_callback():
+            st.rerun()
+    google_auth_url = get_google_auth_url()
+    st.markdown(f"""
+        <div style='display:flex;align-items:center;justify-content:center;height:80vh;'>
+            <div style='background:#222;padding:3em 4em;border-radius:14px;text-align:center;'>
+                <img src="https://cdn.shopify.com/s/files/1/0603/0016/5294/files/logo-1.png?v=1750307988" width="150" style="margin-bottom:2rem;">
+                <h2 style="color:#fff;">Gestión de Inventario Mercado Libre</h2>
+                <p style="color:#aaa;">Solo para usuarios ESPAITEC.mx</p>
+                <a href="{google_auth_url}" style="background:#4285F4;color:#fff;padding:1em 2em;border-radius:6px;text-decoration:none;font-size:1.1em;">Iniciar sesión con Google</a>
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
     st.stop()
-access_token = token_data["access_token"]
 
-# --- Pestañas de Flujo de Trabajo ---
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Paso 1: Cargar Datos", 
-    "Paso 2: Revisar y Confirmar", 
-    "Paso 3: Resultados",
-    "💰 Calculadora de Precios",
-    "🛠️ Herramientas de Recuperación"
-])
-
-# --- PESTAÑA 1: CARGAR DATOS ---
-with tab1:
-    st.header("Paso 1: Cargar y Sincronizar Datos", anchor=False)
-    st.markdown("El primer paso es tener la información más reciente. Extrae tu inventario de Mercado Libre y luego carga el archivo de existencias de tu proveedor.")
-
+# ---- SIDEBAR MENU ----
+with st.sidebar:
+    st.markdown(
+        "<img src='https://cdn.shopify.com/s/files/1/0603/0016/5294/files/logo-1.png?v=1750307988' width='110' class='sidebar-logo'>",
+        unsafe_allow_html=True)
+    st.markdown("<div class='sidebar-title'>Gestor ESPAITEC</div>", unsafe_allow_html=True)
+    menu = st.radio(
+        "Menú principal",
+        options=["Sincronizar Inventario", "Calculadora de Precios", "Auditor de Variaciones", "Historial"],
+        format_func=lambda x: {
+            "Sincronizar Inventario": "🟠 Sincronizar Inventario",
+            "Calculadora de Precios": "💰 Calculadora de Precios",
+            "Auditor de Variaciones": "🔍 Auditor de Variaciones",
+            "Historial": "📂 Historial"
+        }[x],
+        label_visibility="collapsed"
+    )
     st.divider()
+    st.markdown(
+        f"<small>Usuario:<br><b>{st.session_state.user_name}</b><br>{st.session_state.user_email}</small>",
+        unsafe_allow_html=True
+    )
+    if st.button("Cerrar Sesión", use_container_width=True):
+        logout()
 
-    col1, col2 = st.columns(2, gap="large")
+# ---- SECTION 1: INVENTARIO ----
+if menu == "Sincronizar Inventario":
+    st.markdown(
+        "<h1 style='color:#F39200;'>Gestión de Inventario Mercado Libre</h1>"
+        "<div style='color:#888;margin-bottom:20px;'>Actualiza tu inventario de forma segura. <b>Nunca se elimina ninguna variante/publicación.</b></div>",
+        unsafe_allow_html=True
+    )
+    st.header("1. Sincroniza tu inventario en Mercado Libre", anchor=False)
+    st.info(
+        "1. Extrae tu inventario actual de Mercado Libre.\n"
+        "2. Sube el inventario de tu proveedor (Excel con CLAVE_ARTICULO y EXISTENCIAS).\n"
+        "3. Revisa la tabla previa de cambios.\n"
+        "4. Ejecuta la sincronización (solo se modifica inventario; nunca se elimina nada)."
+    )
+    try:
+        access_token = st.secrets["mercadolibre"]["access_token"]
+    except (KeyError, FileNotFoundError):
+        st.error("🔴 No se pudo cargar el token de acceso. Revisa tu archivo `.streamlit/secrets.toml`.")
+        st.stop()
+    # Cargar el último inventario extraído de Mercado Libre
+    if "ml_inventory" not in st.session_state:
+        st.session_state.ml_inventory = None
+        ml_history_dir = "inventario_ml_historial"
+        if os.path.exists(ml_history_dir):
+            ml_files = sorted([f for f in os.listdir(ml_history_dir) if f.endswith(".xlsx")], 
+                             key=lambda x: os.path.getmtime(os.path.join(ml_history_dir, x)),
+                             reverse=True)
+            if ml_files:
+                latest_ml_file = os.path.join(ml_history_dir, ml_files[0])
+                try:
+                    st.session_state.ml_inventory = pd.read_excel(latest_ml_file)
+                    st.session_state.ml_inventory_fecha = datetime.fromtimestamp(os.path.getmtime(latest_ml_file)).strftime("%Y-%m-%d %H:%M:%S")
+                    st.success(f"Inventario cargado automáticamente del historial: {ml_files[0]}")
+                except Exception as e:
+                    st.error(f"Error al cargar el inventario: {str(e)}")
+    
+    if "ml_inventory_fecha" not in st.session_state:
+        st.session_state.ml_inventory_fecha = None
 
-    with col1:
-        with st.container(border=True):
-            st.subheader("📦 Inventario de Mercado Libre")
-            st.markdown("Obtén una copia fresca de todas tus publicaciones activas y pausadas.")
+    # --------- EXTRACCIÓN CON STOP Y PROGRESO ---------
+    if "extraction_job" not in st.session_state:
+        st.session_state.extraction_job = {"status": "idle"}
 
-            if st.session_state.df_inv is not None:
-                st.success(f"Inventario local disponible. Última extracción: **{st.session_state.fecha_inv}**.")
+    def run_extraction_job(token, job_state):
+        """Función principal para extraer el inventario de Mercado Libre en segundo plano."""
+        user_id = get_user_id(token)
+        if not user_id:
+            job_state["status"] = "error"
+            job_state["message"] = "No se pudo obtener tu user_id. Revisa tu token."
+            logger.error("Extracción fallida: No se pudo obtener user_id")
+            return
+
+        # Obtener IDs de todas las publicaciones (activas y pausadas)
+        status_list = ["active", "paused"]
+        all_items_info = []
+        item_ids = []
+        for status in status_list:
+            status_items = get_items(user_id, token, status)
+            logger.info(f"Obtenidas {len(status_items)} publicaciones con status {status}")
+            item_ids.extend(status_items)
+        
+        total_publicaciones = len(item_ids)
+        job_state["total"] = total_publicaciones
+        logger.info(f"Iniciando extracción de {total_publicaciones} publicaciones")
+        
+        # Procesar cada publicación
+        for idx, item_id in enumerate(item_ids):
+            # Verificar si el usuario canceló la operación
+            if job_state["status"] == "cancelled":
+                logger.info("Extracción cancelada por el usuario")
+                return
+
+            # Actualizar progreso
+            job_state["progress"] = (idx + 1) / total_publicaciones
+            job_state["text"] = f"Descargando {idx+1}/{total_publicaciones}"
+
+            # Obtener detalles de la publicación
+            item = get_item_detail(item_id, token)
+            if item:
+                status = item.get("status", "unknown")
                 
-                script_dir = os.path.dirname(__file__)
-                inv_path = os.path.join(script_dir, "inventario_ml.xlsx")
-                if os.path.exists(inv_path):
-                    with open(inv_path, "rb") as f:
-                        st.download_button(
-                            label="📥 Descargar Copia del Inventario Actual",
-                            data=f.read(),
-                            file_name="inventario_ml_extraido.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
-                with st.expander("Ver inventario de Mercado Libre"):
-                    st.dataframe(st.session_state.df_inv, use_container_width=True)
+                # Procesar publicación con variaciones
+                if "variations" in item and item["variations"]:
+                    for v in item["variations"]:
+                        sku = extract_sku_from_item(v)
+                        all_items_info.append({
+                            "status": status, 
+                            "item_id": item_id, 
+                            "título": item.get("title", ""),
+                            "sku": sku, 
+                            "variación_id": v.get("id", np.nan),
+                            "stock": v.get("available_quantity", 0),
+                        })
+                # Procesar publicación sin variaciones
+                else:
+                    sku = extract_sku_from_item(item)
+                    all_items_info.append({
+                        "status": status, 
+                        "item_id": item_id, 
+                        "título": item.get("title", ""),
+                        "sku": sku, 
+                        "variación_id": np.nan,
+                        "stock": item.get("available_quantity", 0),
+                    })
+        
+        if job_state["status"] != "cancelled":
+            # Crear DataFrame con toda la información recolectada
+            df_inv = pd.DataFrame(all_items_info)
+            
+            # Identificar publicaciones sin SKU
+            df_sin_sku = df_inv[df_inv["sku"].apply(lambda x: x is None or str(x).strip() == "")]
+            if not df_sin_sku.empty:
+                job_state["sin_sku"] = True
+                job_state["sin_sku_count"] = len(df_sin_sku)
+                job_state["sin_sku_items"] = df_sin_sku[["item_id", "título"]].drop_duplicates().to_dict('records')
+                logger.warning(f"Se encontraron {len(df_sin_sku)} variaciones sin SKU en {len(job_state['sin_sku_items'])} publicaciones")
             else:
-                st.info("Aún no has extraído tu inventario de Mercado Libre. Haz clic en el botón para empezar.")
+                job_state["sin_sku"] = False
+                logger.info("No se encontraron publicaciones sin SKU")
+            
+            # Guardar en session_state y en historial
+            st.session_state.ml_inventory = df_inv
+            st.session_state.ml_inventory_fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Guardar archivo en historial
+            history_dir = "inventario_ml_historial"
+            manage_file_history(history_dir, ".xlsx")
+            filename = f"ml_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            file_path = os.path.join(history_dir, filename)
+            df_inv.to_excel(file_path, index=False)
+            logger.info(f"Inventario guardado en {file_path} con {len(df_inv)} variantes")
 
-            if st.button("🔄 Sincronizar desde Mercado Libre", use_container_width=True, type="primary"):
-                with st.spinner("Contactando a Mercado Libre... (Puede tardar varios minutos)"):
-                    user_id = get_user_id(access_token)
-                    if not user_id:
-                        st.error("No se pudo obtener tu user_id. Revisa tu token.")
-                        st.stop()
+            job_state["status"] = "done"
 
-                status_list = ["active", "paused"]
-                all_items_info = []
-                
-                progress_bar = st.progress(0, text="Obteniendo IDs de publicaciones...")
-                item_ids = []
-                for status in status_list:
-                    item_ids.extend(get_items(user_id, access_token, status))
-                
-                total_publicaciones = len(item_ids)
-                for idx, item_id in enumerate(item_ids):
-                    progress_bar.progress((idx + 1) / total_publicaciones, text=f"Descargando detalle de publicación {idx+1}/{total_publicaciones}")
-                    item = get_item_detail(item_id, access_token)
-                    if item:
-                        status = item.get("status", "unknown")
-                        if "variations" in item and item["variations"]:
-                            for v in item["variations"]:
-                                all_items_info.append({
-                                    "status": status, "item_id": item_id, "título": item.get("title", ""),
-                                    "sku": v.get("seller_custom_field", ""), "variación_id": v.get("id", np.nan),
-                                    "stock": v.get("available_quantity", 0),
-                                })
-                        else:
-                            all_items_info.append({
-                                "status": status, "item_id": item_id, "título": item.get("title", ""),
-                                "sku": item.get("seller_custom_field", ""), "variación_id": np.nan,
-                                "stock": item.get("available_quantity", 0),
-                            })
-                
-                df_inv_nuevo = pd.DataFrame(all_items_info)
-                guardar_inventario_local(df_inv_nuevo)
-                st.success("¡Extracción completada! Inventario guardado.")
+    col_btn1, col_btn2 = st.columns([5, 1])
+    with col_btn1:
+        if st.session_state.extraction_job["status"] == "running":
+            st.button("🔄 Extrayendo...", use_container_width=True, type="primary", disabled=True)
+        else:
+            if st.button("🔄 Extraer Inventario de Mercado Libre", use_container_width=True, type="primary"):
+                st.session_state.extraction_job = {"status": "running", "progress": 0, "text": "Iniciando..."}
+                job_thread = threading.Thread(target=run_extraction_job, args=(access_token, st.session_state.extraction_job))
+                job_thread.start()
                 st.rerun()
 
-    with col2:
-        with st.container(border=True):
-            st.subheader("🚚 Inventario del Proveedor")
-            st.markdown("Carga el archivo Excel que contiene los SKUs y las existencias actuales.")
-            
-            st.session_state.archivo_proveedor = st.file_uploader(
-                "Selecciona el archivo de existencias del proveedor", 
-                type=["xlsx"],
-                help="Asegúrate de que el archivo contenga las columnas 'CLAVE_ARTICULO' y 'EXISTENCIAS'.",
-                key="proveedor_uploader",
-                label_visibility="collapsed"
-            )
-            if st.session_state.archivo_proveedor:
-                st.success(f"Archivo **{st.session_state.archivo_proveedor.name}** cargado.")
-                with st.expander("Ver contenido del archivo"):
-                    df_prov_preview = pd.read_excel(st.session_state.archivo_proveedor)
-                    st.dataframe(df_prov_preview, use_container_width=True)
+    with col_btn2:
+        if st.session_state.extraction_job["status"] == "running":
+            if st.button("⏹️ Stop", use_container_width=True, type="secondary"):
+                st.session_state.extraction_job["status"] = "cancelled"
+                st.rerun()
+        else:
+            st.button("⏹️ Stop", use_container_width=True, type="secondary", disabled=True)
 
-# --- PESTAÑA 2: REVISAR Y CONFIRMAR ---
-with tab2:
-    st.header("Paso 2: Revisar y Confirmar Cambios", anchor=False)
-    st.markdown("Aquí puedes ver un resumen de los cambios que se aplicarán. **Verifica los datos cuidadosamente antes de confirmar.**")
-    st.divider()
+    if st.session_state.extraction_job["status"] == "running":
+        progress = st.session_state.extraction_job.get("progress", 0)
+        text = st.session_state.extraction_job.get("text", "")
+        st.progress(progress, text=text)
+        time.sleep(1)
+        st.rerun()
+    
+    if st.session_state.extraction_job["status"] == "done":
+        st.success("¡Inventario extraído!")
+        
+        # Mostrar alerta de publicaciones sin SKU
+        if st.session_state.extraction_job.get("sin_sku", False):
+            sin_sku_count = st.session_state.extraction_job.get("sin_sku_count", 0)
+            sin_sku_items = st.session_state.extraction_job.get("sin_sku_items", [])
+            
+            st.warning(f"⚠️ Se encontraron {sin_sku_count} variaciones sin SKU en {len(sin_sku_items)} publicaciones.")
+            
+            with st.expander("Ver publicaciones sin SKU"):
+                for item in sin_sku_items:
+                    st.markdown(f"**{item['item_id']}**: {item['título']}")
+                
+                st.markdown("""
+                **Importante:** Las publicaciones sin SKU no podrán ser actualizadas automáticamente.
+                Te recomendamos agregar SKUs a todas tus publicaciones en Mercado Libre.
+                """)
+        
+        st.session_state.extraction_job = {"status": "idle"}
 
-    if st.session_state.archivo_proveedor and st.session_state.df_inv is not None:
-        df_prov = pd.read_excel(st.session_state.archivo_proveedor)
-        df_prov = df_prov.rename(columns=lambda x: x.strip().upper())
+    if st.session_state.extraction_job["status"] == "cancelled":
+        st.warning("⏹️ Extracción cancelada por el usuario.")
+        st.session_state.extraction_job = {"status": "idle"}
+        
+    if st.session_state.extraction_job["status"] == "error":
+        st.error(st.session_state.extraction_job["message"])
+        st.session_state.extraction_job = {"status": "idle"}
 
-        if "CLAVE_ARTICULO" in df_prov.columns and "EXISTENCIAS" in df_prov.columns:
-            df_prov_filtrado = df_prov[
-                df_prov["CLAVE_ARTICULO"].apply(lambda x: isinstance(x, str) and x.strip() != "") &
-                df_prov["EXISTENCIAS"].apply(lambda x: isinstance(x, (int, float)))
-            ].copy()
-            
-            inventario_dict = dict(zip(df_prov_filtrado["CLAVE_ARTICULO"], df_prov_filtrado["EXISTENCIAS"]))
-            
-            df_merged = st.session_state.df_inv.copy()
-            df_merged['stock_nuevo'] = df_merged['sku'].map(inventario_dict).fillna(0).astype(int)
-            df_merged['stock_nuevo'] = df_merged['stock_nuevo'].apply(lambda x: 0 if x <= 3 else x)
-            df_merged['cambio'] = df_merged['stock'].astype(int) != df_merged['stock_nuevo'].astype(int)
-            
-            df_actualizar = df_merged[df_merged['cambio']].copy()
-            
-            # --- Métricas Visuales ---
-            st.subheader("Resumen de la Sincronización", anchor=False)
-            col1, col2, col3 = st.columns(3)
-            col1.metric("🔄 Variaciones a Actualizar", f"{len(df_actualizar)}")
-            
-            stock_total_nuevo = df_merged.groupby('item_id')['stock_nuevo'].sum()
-            items_a_pausar = stock_total_nuevo[stock_total_nuevo == 0].count()
-            col2.metric("⏸️ Publicaciones a Pausar", f"{items_a_pausar}")
-            
-            col3.metric("✅ Variaciones sin Cambios", f"{len(df_merged) - len(df_actualizar)}")
+    if st.session_state.ml_inventory is not None:
+        st.success(f"Inventario local disponible. Última extracción: {st.session_state.ml_inventory_fecha}")
+        with st.expander("Ver inventario Mercado Libre"):
+            st.dataframe(st.session_state.ml_inventory, use_container_width=True)
+        
+    proveedor_file = st.file_uploader("Sube el inventario del proveedor", type=["xlsx"])
+    
+    # Botón para procesar el inventario
+    procesar_btn = False
+    if st.session_state.ml_inventory is not None and proveedor_file is not None:
+        procesar_btn = st.button("📊 Procesar Inventario", use_container_width=True, type="primary")
 
-            # --- Vista Previa Interactiva ---
-            st.subheader("Vista Previa de Cambios", anchor=False)
-            st.info("Esta tabla muestra únicamente las variaciones cuyo stock será modificado.")
-            st.dataframe(df_actualizar[['item_id', 'título', 'sku', 'stock', 'stock_nuevo']].rename(columns={
-                'item_id': 'ID Publicación', 'título': 'Título', 'sku': 'SKU', 'stock': 'Stock Actual', 'stock_nuevo': 'Stock Nuevo'
-            }), use_container_width=True)
 
-            st.divider()
-            
-            with st.container(border=True):
-                st.warning("🔴 **Acción Irreversible**")
-                st.markdown("Al hacer clic en el botón, se aplicarán los cambios de stock en Mercado Libre. Asegúrate de que todo es correcto.")
-                if st.button("🚀 Confirmar y Ejecutar Sincronización", use_container_width=True, type="primary"):
-                    # --- Lógica de Actualización Segura ---
-                    items_con_cambios = df_actualizar['item_id'].unique()
-                    total_items_a_procesar = len(items_con_cambios)
-                    progreso = st.progress(0, text="Iniciando actualización...")
-                    
-                    results_log = []
+    if procesar_btn:
+            try:
+                # Leer y validar el archivo del proveedor
+                df_prov = pd.read_excel(proveedor_file)
+                df_prov.columns = [str(c).strip().upper() for c in df_prov.columns]
+                
+                # Verificar que tenga las columnas necesarias
+                if not {"CLAVE_ARTICULO", "EXISTENCIAS"}.issubset(df_prov.columns):
+                    st.error("El archivo debe tener las columnas CLAVE_ARTICULO y EXISTENCIAS.")
+                    logger.error("Archivo de proveedor sin columnas requeridas")
+                    st.stop()
+                
+                # Guardar archivo en historial
+                history_dir = "inventario_proveedor_historial"
+                manage_file_history(history_dir, ".xlsx")
+                filename = f"proveedor_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                file_path = os.path.join(history_dir, filename)
+                with open(file_path, "wb") as f:
+                    f.write(proveedor_file.getbuffer())
+                logger.info(f"Archivo de proveedor guardado en {file_path}")
+
+                # Filtrar datos válidos
+                df_prov_filtrado = df_prov[
+                    df_prov["CLAVE_ARTICULO"].apply(lambda x: isinstance(x, str) and x.strip() != "") &
+                    df_prov["EXISTENCIAS"].apply(lambda x: isinstance(x, (int, float)))
+                ].copy()
+                
+                # Crear diccionario de inventario y aplicar a inventario ML
+                inventario_dict = dict(zip(df_prov_filtrado["CLAVE_ARTICULO"], df_prov_filtrado["EXISTENCIAS"]))
+                df_ml = st.session_state.ml_inventory.copy()
+                
+                # Mapear stock nuevo y aplicar regla de seguridad (stock ≤ 3 → stock = 0)
+                df_ml["stock_nuevo"] = df_ml["sku"].map(inventario_dict).fillna(0).astype(int)
+                df_ml["stock_nuevo"] = df_ml["stock_nuevo"].apply(lambda x: 0 if x <= 3 else x)
+                
+                # Identificar cambios
+                df_ml["cambio"] = df_ml["stock"].astype(int) != df_ml["stock_nuevo"].astype(int)
+                st.session_state.df_actualizar = df_ml[df_ml["cambio"]].copy()
+                st.session_state.df_ml = df_ml.copy()
+                
+                logger.info(f"Procesamiento completado: {len(st.session_state.df_actualizar)} variantes con cambios")
+                
+            except Exception as e:
+                st.error(f"Error al procesar el archivo: {str(e)}")
+                logger.error(f"Error en procesamiento de inventario: {str(e)}")
+
+    if "df_actualizar" in st.session_state:
+        st.divider()
+        st.header("2. Vista previa de cambios a aplicar")
+        st.markdown("<b>Solo se modifican existencias. Nunca se elimina ningún SKU/variante/publicación.</b>", unsafe_allow_html=True)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Variaciones a Actualizar", f"{len(st.session_state.df_actualizar)}")
+        stock_total_nuevo = st.session_state.df_ml.groupby('item_id')['stock_nuevo'].sum()
+        items_a_pausar = stock_total_nuevo[stock_total_nuevo == 0].count()
+        col2.metric("Publicaciones a Pausar", f"{items_a_pausar}")
+        col3.metric("Sin Cambio", f"{len(st.session_state.df_ml) - len(st.session_state.df_actualizar)}")
+
+        st.dataframe(st.session_state.df_actualizar[["item_id", "título", "sku", "stock", "stock_nuevo"]], use_container_width=True, hide_index=True)
+        
+        st.divider()
+        st.warning("Al ejecutar, la app actualizará SOLO el inventario de todas las variantes, sin eliminar ninguna. Si una publicación queda en stock 0, se pausa. Revisa bien antes de continuar.", icon="⚠️")
+        if st.button("🚀 Ejecutar sincronización", type="primary", use_container_width=True):
+            with st.spinner("Actualizando Mercado Libre..."):
+                try:
+                    log = []
                     errores_tipo = set()
                     exito_count = 0
                     error_count = 0
-
-                    for i, item_id in enumerate(items_con_cambios):
-                        progreso.progress((i + 1) / total_items_a_procesar, text=f"Procesando item {i+1}/{total_items_a_procesar}: {item_id}")
+                    
+                    # Actualizar cada publicación con cambios
+                    logger.info(f"Iniciando sincronización de {len(st.session_state.df_actualizar['item_id'].unique())} publicaciones")
+                    for item_id in st.session_state.df_actualizar['item_id'].unique():
+                        # Obtener TODAS las variantes de la publicación (no solo las que cambian)
+                        # Esto es CRÍTICO para evitar que Mercado Libre elimine variantes por omisión
+                        all_variations_item = st.session_state.df_ml[st.session_state.df_ml['item_id'] == item_id].copy()
+                        has_variations = not pd.isna(all_variations_item['variación_id'].iloc[0])
                         
-                        item_df = df_merged[df_merged['item_id'] == item_id]
-                        
-                        has_variations = not pd.isna(item_df['variación_id'].iloc[0])
-                        payload = {}
-
+                        # Preparar payload según si tiene variaciones o no
                         if has_variations:
-                            variations_payload = [
-                                {"id": int(row['variación_id']), "available_quantity": int(row['stock_nuevo'])}
-                                for _, row in item_df.iterrows()
-                            ]
+                            # IMPORTANTE: Incluir TODAS las variantes en el payload
+                            variations_payload = [{"id": int(row['variación_id']), "available_quantity": int(row['stock_nuevo'])} 
+                                                for _, row in all_variations_item.iterrows()]
                             payload = {"variations": variations_payload}
+                            logger.info(f"Actualizando {item_id} con {len(variations_payload)} variantes")
                         else:
-                            new_stock = item_df['stock_nuevo'].iloc[0]
-                            payload = {"available_quantity": int(new_stock)}
+                            payload = {"available_quantity": int(all_variations_item['stock_nuevo'].iloc[0])}
+                            logger.info(f"Actualizando {item_id} sin variantes")
                         
-                        update_result = update_item_stock(item_id, payload, access_token)
-
+                        # Actualizar en Mercado Libre
+                        update_result = update_item_stock_safe(item_id, payload, access_token)
                         if update_result["success"]:
-                            num_variations = len(item_df)
-                            exito_count += num_variations
-                            results_log.append(f"✔️ {item_id}: Actualizado con éxito ({num_variations} variaciones/items).")
+                            exito_count += len(all_variations_item)
+                            log.append(f"✔️ {item_id}: Actualizado correctamente ({len(all_variations_item)} variantes/items).")
                         else:
-                            num_variations = len(item_df)
-                            error_count += num_variations
+                            error_count += len(all_variations_item)
                             error_msg = update_result.get("error", "Error desconocido")
                             details = update_result.get("details", "")
                             full_error = f"{error_msg} - {details}" if details else error_msg
-                            results_log.append(f"❌ {item_id}: Error en la actualización. Causa: {full_error}")
+                            log.append(f"❌ {item_id}: Error en actualización. Causa: {full_error}")
                             errores_tipo.add(error_msg)
-
-                    # --- Lógica de Pausado ---
-                    stock_total_nuevo = df_merged.groupby('item_id')['stock_nuevo'].sum()
-                    items_a_pausar_df = stock_total_nuevo[stock_total_nuevo == 0]
                     
-                    if not items_a_pausar_df.empty:
-                        results_log.append("\n--- Iniciando proceso de pausado de publicaciones sin stock ---")
-                        for item_id_pausar in items_a_pausar_df.index:
-                            item_original = st.session_state.df_inv[st.session_state.df_inv['item_id'] == item_id_pausar]
-                            if not item_original.empty and item_original['stock'].sum() > 0:
-                                pause_result = pause_item(item_id_pausar, access_token)
-                                if pause_result["success"]:
-                                    results_log.append(f"⏸️ {item_id_pausar}: Publicación pausada correctamente.")
-                                else:
-                                    error_msg_pause = pause_result.get("error", "Error desconocido")
-                                    results_log.append(f"❌ {item_id_pausar}: Error al intentar pausar. Causa: {error_msg_pause}")
-                                    errores_tipo.add(f"Error al pausar: {error_msg_pause}")
-
-                    st.session_state.results = {
-                        "log": results_log,
-                        "errors": list(errores_tipo),
-                        "exito": exito_count,
-                        "error": error_count
+                    # Pausar publicaciones con stock 0
+                    stock_total_nuevo = st.session_state.df_ml.groupby('item_id')['stock_nuevo'].sum()
+                    items_a_pausar_df = stock_total_nuevo[stock_total_nuevo == 0]
+                    logger.info(f"Pausando {len(items_a_pausar_df)} publicaciones con stock 0")
+                    
+                    for item_id_pausar in items_a_pausar_df.index:
+                        item_original = st.session_state.df_ml[st.session_state.df_ml['item_id'] == item_id_pausar]
+                        if not item_original.empty and item_original['stock'].sum() > 0:
+                            pause_result = pause_item(item_id_pausar, access_token)
+                            if pause_result["success"]:
+                                log.append(f"⏸️ {item_id_pausar}: Publicación pausada correctamente.")
+                            else:
+                                error_msg_pause = pause_result.get("error", "Error desconocido")
+                                log.append(f"❌ {item_id_pausar}: Error al pausar. Causa: {error_msg_pause}")
+                                errores_tipo.add(f"Error al pausar: {error_msg_pause}")
+                    
+                    # Guardar log
+                    log_filename = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                    log_dir = "logs"
+                    if not os.path.exists(log_dir):
+                        os.makedirs(log_dir)
+                    with open(os.path.join(log_dir, log_filename), "w") as f:
+                        f.write("\n".join(log))
+                    
+                    # Guardar resultado en session_state
+                    st.session_state.resultado = {
+                        "log": log, 
+                        "errores": list(errores_tipo), 
+                        "exito": exito_count, 
+                        "error": error_count, 
+                        "log_file": log_filename
                     }
-                    st.success("Proceso finalizado. Ve a la pestaña 'Paso 3: Resultados' para ver el detalle.")
-                    st.rerun()
+                    
+                    logger.info(f"Sincronización completada: {exito_count} éxitos, {error_count} errores")
+                    st.success("¡Proceso terminado! Consulta el resumen abajo.")
+                    
+                    # Limpiar datos temporales
+                    del st.session_state.df_actualizar
+                    del st.session_state.df_ml
+                    
+                except Exception as e:
+                    st.error(f"Error durante la sincronización: {str(e)}")
+                    logger.error(f"Error no controlado durante sincronización: {str(e)}")
 
-        else:
-            st.error("El archivo del proveedor no contiene las columnas 'CLAVE_ARTICULO' y 'EXISTENCIAS'.")
-    else:
-        st.info("Sube un archivo de proveedor y asegúrate de haber extraído el inventario de Mercado Libre para continuar.")
-
-# --- PESTAÑA 3: RESULTADOS ---
-with tab3:
-    st.header("Paso 3: Resultados de la Sincronización", anchor=False)
-    st.markdown("Aquí puedes ver el resumen y el registro detallado del proceso que acaba de terminar.")
-    st.divider()
-
-    if st.session_state.results:
-        res = st.session_state.results
-        col1, col2 = st.columns(2)
-        col1.metric("✅ Actualizaciones Exitosas", res['exito'])
-        col2.metric("❌ Errores", res['error'])
-
-        if res['errors']:
-            st.subheader("Resumen de Errores", anchor=False)
-            for err in res['errors']:
-                st.error(f"**Tipo de Error:** {err}")
-            if any("validación" in err.lower() for err in res['errors']):
-                st.warning("Se encontraron errores de validación. Esto puede ocurrir si una publicación fue modificada manualmente en ML. Se recomienda re-extraer el inventario para asegurar la consistencia de los datos.")
-
-        st.subheader("Registro de Procesamiento", anchor=False)
-        with st.container(height=400):
-            st.code("\n".join(res['log']), language="log")
-        
-        if st.button("✨ Iniciar un Nuevo Proceso"):
-            st.session_state.results = None
+    if "resultado" in st.session_state:
+        res = st.session_state.resultado
+        colA, colB = st.columns(2)
+        colA.metric("Actualizaciones exitosas", res['exito'])
+        colB.metric("Errores", res['error'])
+        if res['errores']:
+            st.subheader("Resumen de errores:")
+            for err in res['errores']:
+                st.error(f"Tipo de Error: {err}")
+        st.subheader("Log de procesamiento:")
+        st.code("\n".join(res['log']), language="log")
+        with open(os.path.join("logs", res['log_file']), "r") as f:
+            st.download_button("Descargar Log Completo", f.read(), file_name=res['log_file'])
+        if st.button("✨ Reiniciar proceso"):
+            del st.session_state.resultado
             st.rerun()
-    else:
-        st.info("Aún no se ha ejecutado ningún proceso de actualización. Completa los pasos 1 y 2.")
 
-# --- PESTAÑA 4: CALCULADORA DE PRECIOS ---
-with tab4:
-    st.header("💰 Catálogo Maestro y Calculadora de Precios")
-    st.markdown("Sube tu lista 'madre' de productos para calcular precios de venta basados en tus costos y la utilidad deseada.")
-
-    master_file = st.file_uploader(
-        "Sube tu archivo Excel 'madre' de productos",
-        type=["xlsx"],
-        key="master_list_uploader"
+# ---- SECTION 2: CALCULADORA DE PRECIOS ----
+elif menu == "Calculadora de Precios":
+    st.markdown(
+        "<h1 style='color:#F39200;'>💰 Calculadora de Precios</h1>"
+        "<div style='color:#888;margin-bottom:20px;'>Calcula el precio ideal considerando costos, IVA, comisiones y utilidad.</div>",
+        unsafe_allow_html=True
     )
-
+    master_file = st.file_uploader("Sube tu archivo Excel 'madre' de productos", type=["xlsx"], key="master_list_uploader")
     st.markdown("---")
     st.subheader("Parámetros de Cálculo")
-    
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         utilidad_deseada = st.number_input("Margen de Utilidad Deseado (%)", min_value=0.0, value=20.0, step=1.0, format="%.2f")
@@ -475,139 +696,92 @@ with tab4:
     with col3:
         iva_porcentaje = st.number_input("IVA (%)", min_value=0.0, value=16.0, step=1.0, format="%.2f")
     with col4:
-        comision_ml_porcentaje = st.number_input("Comisión de Mercado Libre (%)", min_value=0.0, value=15.0, step=0.5, format="%.2f")
-
+        comision_ml_porcentaje = st.number_input("Comisión ML (%)", min_value=0.0, value=15.0, step=0.5, format="%.2f")
     if master_file:
         df_master = pd.read_excel(master_file)
         df_master.columns = [str(c).strip().upper() for c in df_master.columns]
-
         if "PRECIO MAYOREO" in df_master.columns:
-            
             def calcular_precio_venta(costo):
                 if pd.isna(costo) or not isinstance(costo, (int, float)) or costo <= 0:
                     return np.nan
-                
-                # Convertir porcentajes a decimales
                 utilidad_dec = utilidad_deseada / 100.0
                 iva_dec = iva_porcentaje / 100.0
                 comision_ml_dec = comision_ml_porcentaje / 100.0
-
-                # Fórmula de precios
                 precio_sugerido = (costo * (1 + iva_dec + utilidad_dec) + costo_envio_promedio) / (1 - comision_ml_dec)
-
-                # Regla de negocio: precio mínimo de $299
-                if precio_sugerido < 299.00:
-                    precio_final = 299.00
-                else:
-                    # Redondear siempre hacia arriba al siguiente peso entero
-                    precio_final = math.ceil(precio_sugerido)
-                
-                return precio_final
-
+                return np.ceil(precio_sugerido) if precio_sugerido >= 299.00 else 299.00
             df_master['PRECIO VENTA SUGERIDO'] = df_master['PRECIO MAYOREO'].apply(calcular_precio_venta)
-            
             st.markdown("---")
             st.subheader("Catálogo con Precios Calculados")
-            
-            columnas_a_mostrar = [
-                "CLAVE_ARTICULO", "DESCRIPCION DEL ARTICULO", "PRECIO MAYOREO", "PRECIO VENTA SUGERIDO"
-            ]
+            columnas_a_mostrar = ["CLAVE_ARTICULO", "DESCRIPCION DEL ARTICULO", "PRECIO MAYOREO", "PRECIO VENTA SUGERIDO"]
             columnas_existentes = [col for col in columnas_a_mostrar if col in df_master.columns]
-            
             st.dataframe(df_master[columnas_existentes], use_container_width=True)
-
-            # Botón para descargar el reporte
             output_precios = io.BytesIO()
             with pd.ExcelWriter(output_precios, engine='openpyxl') as writer:
                 df_master.to_excel(writer, index=False)
-            
-            st.download_button(
-                label="📥 Descargar Catálogo con Precios Calculados",
-                data=output_precios.getvalue(),
-                file_name="catalogo_precios_calculados.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-
+            st.download_button("Descargar Catálogo con Precios Calculados", data=output_precios.getvalue(), file_name="catalogo_precios_calculados.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else:
             st.error("El archivo maestro no contiene la columna 'PRECIO MAYOREO'. Por favor, verifica el archivo.")
 
-# --- PESTAÑA 5: HERRAMIENTAS DE RECUPERACIÓN ---
-with tab5:
-    st.header("🔍 Auditor de Variaciones Perdidas")
-    st.warning("""
-        **Propósito:** Esta herramienta te ayuda a identificar variaciones que pueden haber sido eliminadas accidentalmente de tus publicaciones.
-        Compara un archivo de respaldo (antes del problema) con un archivo actual (después del problema) para generar un reporte de lo que falta.
-    """)
-
+# ---- SECTION 3: AUDITOR ----
+elif menu == "Auditor de Variaciones":
+    st.markdown(
+        "<h1 style='color:#F39200;'>🔍 Auditor de Variaciones Perdidas</h1>"
+        "<div style='color:#888;margin-bottom:20px;'>Compara dos inventarios y detecta variaciones o SKUs que se hayan perdido.</div>",
+        unsafe_allow_html=True
+    )
     col1, col2 = st.columns(2)
     with col1:
-        respaldo_file = st.file_uploader(
-            "1. Sube tu inventario de RESPALDO (el archivo bueno)", 
-            type=["xlsx"],
-            key="respaldo_uploader"
-        )
+        respaldo_file = st.file_uploader("1. Sube tu inventario de RESPALDO (archivo bueno)", type=["xlsx"], key="respaldo_uploader")
     with col2:
-        actual_file = st.file_uploader(
-            "2. Sube tu inventario ACTUAL (extraído después del problema)", 
-            type=["xlsx"],
-            key="actual_uploader"
-        )
-
+        actual_file = st.file_uploader("2. Sube tu inventario ACTUAL (tras el problema)", type=["xlsx"], key="actual_uploader")
     if respaldo_file and actual_file:
         df_respaldo = pd.read_excel(respaldo_file)
         df_actual = pd.read_excel(actual_file)
-
-        # Contar variaciones por item en cada dataframe
         counts_respaldo = df_respaldo.groupby('item_id').size()
         counts_actual = df_actual.groupby('item_id').size()
-
-        # Comparar los conteos
         df_compare = pd.DataFrame({'respaldo': counts_respaldo, 'actual': counts_actual}).fillna(0)
         df_compare['diferencia'] = df_compare['respaldo'] - df_compare['actual']
-        
         items_afectados = df_compare[df_compare['diferencia'] > 0].index
-
         if not items_afectados.empty:
             st.subheader("Publicaciones con Variaciones Faltantes")
-            
-            # Identificar las variaciones exactas que faltan
-            # Usamos 'indicator=True' para saber de dónde viene cada fila
-            df_merged = df_respaldo.merge(
-                df_actual, 
-                on=['item_id', 'variación_id'], 
-                how='outer', 
-                indicator=True
-            )
-            
-            # Las que solo existen en el respaldo son las perdidas
+            df_merged = df_respaldo.merge(df_actual, on=['item_id', 'variación_id'], how='outer', indicator=True)
             df_perdidas = df_merged[df_merged['_merge'] == 'left_only']
-            
-            # Filtrar solo para los items que sabemos que están afectados
             df_reporte = df_perdidas[df_perdidas['item_id'].isin(items_afectados)]
-            
             columnas_reporte = ['item_id', 'título_x', 'sku_x', 'variación_id']
-            df_reporte = df_reporte[columnas_reporte].rename(columns={
-                'título_x': 'título',
-                'sku_x': 'sku'
-            })
-
+            df_reporte = df_reporte[columnas_reporte].rename(columns={'título_x': 'título', 'sku_x': 'sku'})
             st.dataframe(df_reporte, use_container_width=True)
             st.success(f"Se encontraron {len(df_reporte)} variaciones faltantes en {len(items_afectados)} publicaciones.")
-
-            # Botón para descargar el reporte
             output_reporte = io.BytesIO()
             with pd.ExcelWriter(output_reporte, engine='openpyxl') as writer:
                 df_reporte.to_excel(writer, index=False)
-            
-            st.download_button(
-                label="📥 Descargar Reporte de Variaciones Faltantes",
-                data=output_reporte.getvalue(),
-                file_name="reporte_variaciones_faltantes.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                type="primary"
-            )
-
+            st.download_button("Descargar Reporte de Variaciones Faltantes", data=output_reporte.getvalue(), file_name="reporte_variaciones_faltantes.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else:
-            st.success("✅ ¡Excelente! No se encontraron diferencias en el número de variaciones entre los dos archivos.")
+            st.success("✅ ¡No se encontraron diferencias en el número de variaciones entre los dos archivos!")
+
+# ---- SECTION 4: HISTORIAL ----
+elif menu == "Historial":
+    st.markdown(
+        "<h1 style='color:#F39200;'>📂 Historial de Archivos</h1>"
+        "<div style='color:#888;margin-bottom:20px;'>Aquí puedes descargar los últimos 3 archivos de inventario de Mercado Libre y de tu proveedor.</div>",
+        unsafe_allow_html=True
+    )
+
+    st.subheader("Historial de Inventarios de Mercado Libre")
+    ml_history_dir = "inventario_ml_historial"
+    if os.path.exists(ml_history_dir):
+        ml_files = sorted(os.listdir(ml_history_dir), reverse=True)
+        for f in ml_files:
+            with open(os.path.join(ml_history_dir, f), "rb") as file:
+                st.download_button(f, file.read(), file_name=f)
+    else:
+        st.info("No hay historial de inventarios de Mercado Libre.")
+
+    st.subheader("Historial de Inventarios del Proveedor")
+    prov_history_dir = "inventario_proveedor_historial"
+    if os.path.exists(prov_history_dir):
+        prov_files = sorted(os.listdir(prov_history_dir), reverse=True)
+        for f in prov_files:
+            with open(os.path.join(prov_history_dir, f), "rb") as file:
+                st.download_button(f, file.read(), file_name=f)
+    else:
+        st.info("No hay historial de inventarios del proveedor.")
