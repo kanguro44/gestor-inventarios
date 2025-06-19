@@ -127,13 +127,12 @@ def pause_item(item_id, token):
         return {"success": False, "error": str(e)}
 
 # --- Manejo de Archivos Locales ---
+import os
+
 def load_token():
-    # Construye la ruta al archivo de token relativa a la ubicación del script
-    script_dir = os.path.dirname(__file__)
-    token_path = os.path.join(script_dir, "ml_token.json")
-    if os.path.exists(token_path):
-        with open(token_path, "r") as f:
-            return json.load(f)
+    access_token = os.getenv("ML_ACCESS_TOKEN")
+    if access_token:
+        return {"access_token": access_token}
     return None
 
 def guardar_inventario_local(df):
