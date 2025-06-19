@@ -83,11 +83,11 @@ def handle_oauth_callback():
         if "RENDER" in os.environ:
             client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
             client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
-            redirect_uri = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
+            redirect_uri = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI", "").rstrip('/')
         else:
             client_id = st.secrets["google_oauth"]["client_id"]
             client_secret = st.secrets["google_oauth"]["client_secret"]
-            redirect_uri = st.secrets["google_oauth"]["redirect_uri"]
+            redirect_uri = st.secrets["google_oauth"]["redirect_uri"].rstrip('/')
 
         client_config = {
             "web": {
@@ -135,10 +135,10 @@ def get_google_auth_url():
     # Detectar si estamos en Render y leer desde variables de entorno
     if "RENDER" in os.environ:
         client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
-        redirect_uri = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
+        redirect_uri = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI", "").rstrip('/')
     else:
         client_id = st.secrets["google_oauth"]["client_id"]
-        redirect_uri = st.secrets["google_oauth"]["redirect_uri"]
+        redirect_uri = st.secrets["google_oauth"]["redirect_uri"].rstrip('/')
         
     return (
         "https://accounts.google.com/o/oauth2/auth"
