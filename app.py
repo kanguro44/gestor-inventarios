@@ -79,11 +79,21 @@ def handle_oauth_callback():
         if not code:
             return False
 
+        # Detectar si estamos en Render y leer desde variables de entorno
+        if "RENDER" in os.environ:
+            client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+            client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+            redirect_uri = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
+        else:
+            client_id = st.secrets["google_oauth"]["client_id"]
+            client_secret = st.secrets["google_oauth"]["client_secret"]
+            redirect_uri = st.secrets["google_oauth"]["redirect_uri"]
+
         client_config = {
             "web": {
-                "client_id": st.secrets["google_oauth"]["client_id"],
-                "client_secret": st.secrets["google_oauth"]["client_secret"],
-                "redirect_uris": [st.secrets["google_oauth"]["redirect_uri"]],
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uris": [redirect_uri],
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token"
             }
@@ -92,7 +102,7 @@ def handle_oauth_callback():
         flow = Flow.from_client_config(
             client_config,
             scopes=["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"],
-            redirect_uri=st.secrets["google_oauth"]["redirect_uri"]
+            redirect_uri=redirect_uri
         )
         
         flow.fetch_token(code=code)
@@ -122,10 +132,18 @@ def handle_oauth_callback():
         return False
 
 def get_google_auth_url():
+    # Detectar si estamos en Render y leer desde variables de entorno
+    if "RENDER" in os.environ:
+        client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+        redirect_uri = os.environ.get("GOOGLE_OAUTH_REDIRECT_URI")
+    else:
+        client_id = st.secrets["google_oauth"]["client_id"]
+        redirect_uri = st.secrets["google_oauth"]["redirect_uri"]
+        
     return (
         "https://accounts.google.com/o/oauth2/auth"
-        f"?client_id={st.secrets['google_oauth']['client_id']}"
-        f"&redirect_uri={urllib.parse.quote(st.secrets['google_oauth']['redirect_uri'])}"
+        f"?client_id={client_id}"
+        f"&redirect_uri={urllib.parse.quote(redirect_uri)}"
         f"&scope={urllib.parse.quote('openid email profile')}"
         "&response_type=code"
         f"&state={st.session_state.state}"
@@ -327,10 +345,18 @@ if menu == "Sincronizar Inventario":
         "3. Revisa la tabla previa de cambios.\n"
         "4. Ejecuta la sincronización (solo se modifica inventario; nunca se elimina nada)."
     )
-    try:
-        access_token = st.secrets["mercadolibre"]["access_token"]
-    except (KeyError, FileNotFoundError):
-        st.error("🔴 No se pudo cargar el token de acceso. Revisa tu archivo `.streamlit/secrets.toml`.")
+    # Detectar si estamos en Render y leer desde variables de entorno
+    if "RENDER" in os.environ:
+        access_token = os.environ.get("MERCADOLIBRE_ACCESS_TOKEN")
+    else:
+        try:
+            access_token = st.secrets["mercadolibre"]["access_token"]
+        except (KeyError, FileNotFoundError):
+            st.error("🔴 No se pudo cargar el token de acceso. Revisa tu archivo `.streamlit/secrets.toml`.")
+            st.stop()
+            
+    if not access_token:
+        st.error("🔴 El token de acceso de Mercado Libre no está configurado.")
         st.stop()
     # Cargar el último inventario extraído de Mercado Libre
     if "ml_inventory" not in st.session_state:
