@@ -165,6 +165,37 @@ def manage_file_history(directory, file_extension, max_files=3):
         os.remove(history.pop(0))
 
 # ---- API MERCADO LIBRE ----
+def refresh_access_token(client_id, client_secret):
+    """Obtiene un nuevo token de acceso usando las credenciales de la aplicación."""
+    url = "https://api.mercadolibre.com/oauth/token"
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json"
+    }
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret
+    }
+    
+    try:
+        resp = requests.post(url, headers=headers, data=data, timeout=10)
+        resp.raise_for_status()
+        token_info = resp.json()
+        
+        # Guardar el nuevo token en las variables de entorno en memoria
+        os.environ["MERCADOLIBRE_ACCESS_TOKEN"] = token_info["access_token"]
+        
+        # Registrar la renovación en el log
+        logger.info(f"Token de Mercado Libre renovado. Expira en {token_info.get('expires_in')} segundos.")
+        
+        return token_info["access_token"]
+    except requests.RequestException as e:
+        logger.error(f"Error al renovar el token: {str(e)}")
+        if hasattr(e, 'response') and e.response:
+            logger.error(f"Respuesta del servidor: {e.response.text}")
+        return None
+
 def get_headers(token):
     """Genera los headers de autorización para la API de Mercado Libre."""
     return {"Authorization": f"Bearer {token}"}
@@ -174,6 +205,32 @@ def get_user_id(token):
     url = "https://api.mercadolibre.com/users/me"
     try:
         resp = requests.get(url, headers=get_headers(token), timeout=10)
+        
+        # Si el token expiró (401), intentar renovarlo
+        if resp.status_code == 401:
+            logger.warning("Token expirado. Intentando renovar...")
+            
+            # Obtener credenciales para renovar
+            if "RENDER" in os.environ:
+                client_id = os.environ.get("MERCADOLIBRE_CLIENT_ID")
+                client_secret = os.environ.get("MERCADOLIBRE_CLIENT_SECRET")
+            else:
+                try:
+                    client_id = st.secrets["mercadolibre"]["client_id"]
+                    client_secret = st.secrets["mercadolibre"]["client_secret"]
+                except (KeyError, FileNotFoundError):
+                    logger.error("No se encontraron las credenciales para renovar el token")
+                    return None
+            
+            # Renovar token
+            new_token = refresh_access_token(client_id, client_secret)
+            if new_token:
+                # Reintentar con el nuevo token
+                resp = requests.get(url, headers=get_headers(new_token), timeout=10)
+            else:
+                logger.error("No se pudo renovar el token")
+                return None
+        
         resp.raise_for_status()
         return resp.json()["id"]
     except requests.RequestException as e:
@@ -348,9 +405,13 @@ if menu == "Sincronizar Inventario":
     # Detectar si estamos en Render y leer desde variables de entorno
     if "RENDER" in os.environ:
         access_token = os.environ.get("MERCADOLIBRE_ACCESS_TOKEN")
+        client_id = os.environ.get("MERCADOLIBRE_CLIENT_ID")
+        client_secret = os.environ.get("MERCADOLIBRE_CLIENT_SECRET")
     else:
         try:
             access_token = st.secrets["mercadolibre"]["access_token"]
+            client_id = st.secrets["mercadolibre"].get("client_id")
+            client_secret = st.secrets["mercadolibre"].get("client_secret")
         except (KeyError, FileNotFoundError):
             st.error("🔴 No se pudo cargar el token de acceso. Revisa tu archivo `.streamlit/secrets.toml`.")
             st.stop()
@@ -358,6 +419,15 @@ if menu == "Sincronizar Inventario":
     if not access_token:
         st.error("🔴 El token de acceso de Mercado Libre no está configurado.")
         st.stop()
+        
+    # Verificar si tenemos las credenciales para renovación automática
+    if client_id and client_secret:
+        st.session_state.ml_can_refresh = True
+        st.session_state.ml_client_id = client_id
+        st.session_state.ml_client_secret = client_secret
+    else:
+        st.session_state.ml_can_refresh = False
+        st.warning("⚠️ No se han configurado las credenciales para la renovación automática de tokens. Si el token expira, tendrás que renovarlo manualmente.")
     # Cargar el último inventario extraído de Mercado Libre
     if "ml_inventory" not in st.session_state:
         st.session_state.ml_inventory = None
