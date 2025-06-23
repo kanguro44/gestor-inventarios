@@ -1,3 +1,4 @@
+e
 import streamlit as st
 import requests
 import json
@@ -270,27 +271,37 @@ def get_item_detail(item_id, token):
         return None
 
 def extract_sku_from_item(item_or_variation):
-    """Extrae el SKU de un item o variación buscando en múltiples campos posibles."""
-    # 1. seller_custom_field
-    sku = item_or_variation.get("seller_custom_field", "")
-    # 2. attribute_combinations o attributes
-    if not sku:
-        for field in ["attribute_combinations", "attributes"]:
-            if field in item_or_variation:
-                for attr in item_or_variation[field]:
-                    if attr.get("id", "").upper() in ["SELLER_SKU", "SKU"]:
-                        sku = attr.get("value_name", "")
-                        if sku:
-                            break
-            if sku:
-                break
-    # 3. sku directo
-    if not sku:
-        sku = item_or_variation.get("sku", "")
-    # 4. variation_sku (por si acaso)
-    if not sku:
-        sku = item_or_variation.get("variation_sku", "")
-    return str(sku).strip() if sku else ""
+    """Extrae el SKU de un item o variación buscando en múltiples campos posibles, evitando falsos positivos."""
+    # 1. seller_custom_field (preferido, si es string no vacío)
+    sku = item_or_variation.get("seller_custom_field", None)
+    if isinstance(sku, str) and sku.strip():
+        return sku.strip()
+
+    # 2. attribute_combinations y attributes: buscar id o name relacionado a SKU
+    attr_fields = []
+    if "attribute_combinations" in item_or_variation:
+        attr_fields.append("attribute_combinations")
+    if "attributes" in item_or_variation:
+        attr_fields.append("attributes")
+    for field in attr_fields:
+        for attr in item_or_variation.get(field, []):
+            # Buscar por id o name que contenga 'SKU' (case-insensitive)
+            if (
+                ("id" in attr and isinstance(attr["id"], str) and "SKU" in attr["id"].upper()) or
+                ("name" in attr and isinstance(attr["name"], str) and "SKU" in attr["name"].upper())
+            ):
+                value = attr.get("value_name") or attr.get("value")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+    # 3. sku o variation_sku directo
+    for key in ["sku", "variation_sku"]:
+        value = item_or_variation.get(key, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    # 4. No se encontró SKU válido
+    return ""
 
 def update_item_stock_safe(item_id, all_variations, token):
     """Actualiza el stock de un item asegurando que se envíen TODAS las variantes para evitar eliminaciones."""
@@ -492,6 +503,7 @@ if menu == "Sincronizar Inventario":
             item = get_item_detail(item_id, token)
             if item:
                 status = item.get("status", "unknown")
+                
                 # Procesar publicación con variaciones
                 if "variations" in item and item["variations"]:
                     for v in item["variations"]:
@@ -517,24 +529,26 @@ if menu == "Sincronizar Inventario":
                     })
         
         if job_state["status"] != "cancelled":
+            # Crear DataFrame con toda la información recolectada
             df_inv = pd.DataFrame(all_items_info)
+            
             # Identificar publicaciones sin SKU
             df_sin_sku = df_inv[df_inv["sku"].apply(lambda x: x is None or str(x).strip() == "")]
             if not df_sin_sku.empty:
                 job_state["sin_sku"] = True
                 job_state["sin_sku_count"] = len(df_sin_sku)
                 job_state["sin_sku_items"] = df_sin_sku[["item_id", "título"]].drop_duplicates().to_dict('records')
-                # Guardar reporte Excel de publicaciones/variaciones sin SKU
-                sin_sku_dir = "reportes_sin_sku"
+                logger.warning(f"Se encontraron {len(df_sin_sku)} variaciones sin SKU en {len(job_state['sin_sku_items'])} publicaciones")
+                # Guardar reporte persistente de variaciones/publicaciones sin SKU
+                sin_sku_dir = "sin_sku_historial"
                 if not os.path.exists(sin_sku_dir):
                     os.makedirs(sin_sku_dir)
-                reporte_path = os.path.join(sin_sku_dir, f"sin_sku_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-                df_sin_sku.to_excel(reporte_path, index=False)
-                job_state["sin_sku_reporte"] = reporte_path
-                logger.warning(f"Se encontraron {len(df_sin_sku)} variaciones sin SKU en {len(job_state['sin_sku_items'])} publicaciones")
+                sin_sku_filename = f"sin_sku_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                sin_sku_path = os.path.join(sin_sku_dir, sin_sku_filename)
+                df_sin_sku.to_excel(sin_sku_path, index=False)
+                job_state["sin_sku_file"] = sin_sku_filename
             else:
                 job_state["sin_sku"] = False
-                job_state["sin_sku_reporte"] = None
                 logger.info("No se encontraron publicaciones sin SKU")
             
             # Guardar en session_state y en historial
@@ -554,21 +568,20 @@ if menu == "Sincronizar Inventario":
     col_btn1, col_btn2 = st.columns([5, 1])
     with col_btn1:
         if st.session_state.extraction_job["status"] == "running":
-            st.button("🔄 Extrayendo...", use_container_width=True, type="primary", disabled=True)
+            st.button("🔄 Extrayendo...", use_container_width=False, type="primary", disabled=True, key="extract_btn_running")
         else:
-            if st.button("🔄 Extraer Inventario de Mercado Libre", use_container_width=True, type="primary"):
+            if st.button("🔄 Extraer Inventario de Mercado Libre", use_container_width=False, type="primary", key="extract_btn"):  # más pequeño y alineado a la izq
                 st.session_state.extraction_job = {"status": "running", "progress": 0, "text": "Iniciando..."}
                 job_thread = threading.Thread(target=run_extraction_job, args=(access_token, st.session_state.extraction_job))
                 job_thread.start()
                 st.rerun()
-
     with col_btn2:
         if st.session_state.extraction_job["status"] == "running":
-            if st.button("⏹️ Stop", use_container_width=True, type="secondary"):
+            if st.button("⏹️ Stop", use_container_width=False, type="secondary", key="stop_btn"):  # más pequeño
                 st.session_state.extraction_job["status"] = "cancelled"
                 st.rerun()
         else:
-            st.button("⏹️ Stop", use_container_width=True, type="secondary", disabled=True)
+            st.button("⏹️ Stop", use_container_width=False, type="secondary", disabled=True, key="stop_btn_disabled")
 
     if st.session_state.extraction_job["status"] == "running":
         progress = st.session_state.extraction_job.get("progress", 0)
@@ -584,14 +597,8 @@ if menu == "Sincronizar Inventario":
         if st.session_state.extraction_job.get("sin_sku", False):
             sin_sku_count = st.session_state.extraction_job.get("sin_sku_count", 0)
             sin_sku_items = st.session_state.extraction_job.get("sin_sku_items", [])
+            sin_sku_file = st.session_state.extraction_job.get("sin_sku_file", None)
             st.warning(f"⚠️ Se encontraron {sin_sku_count} variaciones sin SKU en {len(sin_sku_items)} publicaciones.")
-            if st.session_state.extraction_job.get("sin_sku_reporte"):
-                with open(st.session_state.extraction_job["sin_sku_reporte"], "rb") as f:
-                    st.download_button(
-                        "Descargar reporte de publicaciones sin SKU",
-                        f.read(),
-                        file_name=os.path.basename(st.session_state.extraction_job["sin_sku_reporte"])
-                    )
             with st.expander("Ver publicaciones sin SKU"):
                 for item in sin_sku_items:
                     st.markdown(f"**{item['item_id']}**: {item['título']}")
@@ -599,7 +606,12 @@ if menu == "Sincronizar Inventario":
                 **Importante:** Las publicaciones sin SKU no podrán ser actualizadas automáticamente.
                 Te recomendamos agregar SKUs a todas tus publicaciones en Mercado Libre.
                 """)
-        
+                if sin_sku_file:
+                    sin_sku_dir = "sin_sku_historial"
+                    sin_sku_path = os.path.join(sin_sku_dir, sin_sku_file)
+                    if os.path.exists(sin_sku_path):
+                        with open(sin_sku_path, "rb") as f:
+                            st.download_button("Descargar reporte de variaciones/publicaciones sin SKU", f.read(), file_name=sin_sku_file)
         st.session_state.extraction_job = {"status": "idle"}
 
     if st.session_state.extraction_job["status"] == "cancelled":
@@ -612,7 +624,7 @@ if menu == "Sincronizar Inventario":
 
     if st.session_state.ml_inventory is not None:
         st.success(f"Inventario local disponible. Última extracción: {st.session_state.ml_inventory_fecha}")
-        with st.expander("Ver inventario Mercado Libre"):
+        with st.expander("Ver inventario Mercado Libre", expanded=False):
             st.dataframe(st.session_state.ml_inventory, use_container_width=True)
         
     proveedor_file = st.file_uploader("Sube el inventario del proveedor", type=["xlsx"])
@@ -671,103 +683,102 @@ if menu == "Sincronizar Inventario":
 
     if "df_actualizar" in st.session_state:
         st.divider()
-        st.header("2. Vista previa de cambios a aplicar")
-        st.markdown("<b>Solo se modifican existencias. Nunca se elimina ningún SKU/variante/publicación.</b>", unsafe_allow_html=True)
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Variaciones a Actualizar", f"{len(st.session_state.df_actualizar)}")
-        stock_total_nuevo = st.session_state.df_ml.groupby('item_id')['stock_nuevo'].sum()
-        items_a_pausar = stock_total_nuevo[stock_total_nuevo == 0].count()
-        col2.metric("Publicaciones a Pausar", f"{items_a_pausar}")
-        col3.metric("Sin Cambio", f"{len(st.session_state.df_ml) - len(st.session_state.df_actualizar)}")
-
-        st.dataframe(st.session_state.df_actualizar[["item_id", "título", "sku", "stock", "stock_nuevo"]], use_container_width=True, hide_index=True)
-        
+        with st.expander("Vista previa de cambios a aplicar", expanded=True):
+            st.header("2. Vista previa de cambios a aplicar")
+            st.markdown("<b>Solo se modifican existencias. Nunca se elimina ningún SKU/variante/publicación.</b>", unsafe_allow_html=True)
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Variaciones a Actualizar", f"{len(st.session_state.df_actualizar)}")
+            stock_total_nuevo = st.session_state.df_ml.groupby('item_id')['stock_nuevo'].sum()
+            items_a_pausar = stock_total_nuevo[stock_total_nuevo == 0].count()
+            col2.metric("Publicaciones a Pausar", f"{items_a_pausar}")
+            col3.metric("Sin Cambio", f"{len(st.session_state.df_ml) - len(st.session_state.df_actualizar)}")
+            st.dataframe(st.session_state.df_actualizar[["item_id", "título", "sku", "stock", "stock_nuevo"]], use_container_width=True, hide_index=True)
         st.divider()
-        st.warning("Al ejecutar, la app actualizará SOLO el inventario de todas las variantes, sin eliminar ninguna. Si una publicación queda en stock 0, se pausa. Revisa bien antes de continuar.", icon="⚠️")
-        if st.button("🚀 Ejecutar sincronización", type="primary", use_container_width=True):
-            with st.spinner("Actualizando Mercado Libre..."):
-                try:
-                    log = []
-                    errores_tipo = set()
-                    exito_count = 0
-                    error_count = 0
-                    
-                    # Actualizar cada publicación con cambios
-                    logger.info(f"Iniciando sincronización de {len(st.session_state.df_actualizar['item_id'].unique())} publicaciones")
-                    for item_id in st.session_state.df_actualizar['item_id'].unique():
-                        # Obtener TODAS las variantes de la publicación (no solo las que cambian)
-                        # Esto es CRÍTICO para evitar que Mercado Libre elimine variantes por omisión
-                        all_variations_item = st.session_state.df_ml[st.session_state.df_ml['item_id'] == item_id].copy()
-                        has_variations = not pd.isna(all_variations_item['variación_id'].iloc[0])
+        with st.expander("Advertencia de sincronización", expanded=False):
+            st.warning("Al ejecutar, la app actualizará SOLO el inventario de todas las variantes, sin eliminar ninguna. Si una publicación queda en stock 0, se pausa. Revisa bien antes de continuar.", icon="⚠️")
+            if st.button("🚀 Ejecutar sincronización", type="primary", use_container_width=False, key="ejecutar_sync_btn"):
+                with st.spinner("Actualizando Mercado Libre..."):
+                    try:
+                        log = []
+                        errores_tipo = set()
+                        exito_count = 0
+                        error_count = 0
                         
-                        # Preparar payload según si tiene variaciones o no
-                        if has_variations:
-                            # IMPORTANTE: Incluir TODAS las variantes en el payload
-                            variations_payload = [{"id": int(row['variación_id']), "available_quantity": int(row['stock_nuevo'])} 
-                                                for _, row in all_variations_item.iterrows()]
-                            payload = {"variations": variations_payload}
-                            logger.info(f"Actualizando {item_id} con {len(variations_payload)} variantes")
-                        else:
-                            payload = {"available_quantity": int(all_variations_item['stock_nuevo'].iloc[0])}
-                            logger.info(f"Actualizando {item_id} sin variantes")
-                        
-                        # Actualizar en Mercado Libre
-                        update_result = update_item_stock_safe(item_id, payload, access_token)
-                        if update_result["success"]:
-                            exito_count += len(all_variations_item)
-                            log.append(f"✔️ {item_id}: Actualizado correctamente ({len(all_variations_item)} variantes/items).")
-                        else:
-                            error_count += len(all_variations_item)
-                            error_msg = update_result.get("error", "Error desconocido")
-                            details = update_result.get("details", "")
-                            full_error = f"{error_msg} - {details}" if details else error_msg
-                            log.append(f"❌ {item_id}: Error en actualización. Causa: {full_error}")
-                            errores_tipo.add(error_msg)
-                    
-                    # Pausar publicaciones con stock 0
-                    stock_total_nuevo = st.session_state.df_ml.groupby('item_id')['stock_nuevo'].sum()
-                    items_a_pausar_df = stock_total_nuevo[stock_total_nuevo == 0]
-                    logger.info(f"Pausando {len(items_a_pausar_df)} publicaciones con stock 0")
-                    
-                    for item_id_pausar in items_a_pausar_df.index:
-                        item_original = st.session_state.df_ml[st.session_state.df_ml['item_id'] == item_id_pausar]
-                        if not item_original.empty and item_original['stock'].sum() > 0:
-                            pause_result = pause_item(item_id_pausar, access_token)
-                            if pause_result["success"]:
-                                log.append(f"⏸️ {item_id_pausar}: Publicación pausada correctamente.")
+                        # Actualizar cada publicación con cambios
+                        logger.info(f"Iniciando sincronización de {len(st.session_state.df_actualizar['item_id'].unique())} publicaciones")
+                        for item_id in st.session_state.df_actualizar['item_id'].unique():
+                            # Obtener TODAS las variantes de la publicación (no solo las que cambian)
+                            # Esto es CRÍTICO para evitar que Mercado Libre elimine variantes por omisión
+                            all_variations_item = st.session_state.df_ml[st.session_state.df_ml['item_id'] == item_id].copy()
+                            has_variations = not pd.isna(all_variations_item['variación_id'].iloc[0])
+                            
+                            # Preparar payload según si tiene variaciones o no
+                            if has_variations:
+                                # IMPORTANTE: Incluir TODAS las variantes en el payload
+                                variations_payload = [{"id": int(row['variación_id']), "available_quantity": int(row['stock_nuevo'])} 
+                                                    for _, row in all_variations_item.iterrows()]
+                                payload = {"variations": variations_payload}
+                                logger.info(f"Actualizando {item_id} con {len(variations_payload)} variantes")
                             else:
-                                error_msg_pause = pause_result.get("error", "Error desconocido")
-                                log.append(f"❌ {item_id_pausar}: Error al pausar. Causa: {error_msg_pause}")
-                                errores_tipo.add(f"Error al pausar: {error_msg_pause}")
-                    
-                    # Guardar log
-                    log_filename = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                    log_dir = "logs"
-                    if not os.path.exists(log_dir):
-                        os.makedirs(log_dir)
-                    with open(os.path.join(log_dir, log_filename), "w") as f:
-                        f.write("\n".join(log))
-                    
-                    # Guardar resultado en session_state
-                    st.session_state.resultado = {
-                        "log": log, 
-                        "errores": list(errores_tipo), 
-                        "exito": exito_count, 
-                        "error": error_count, 
-                        "log_file": log_filename
-                    }
-                    
-                    logger.info(f"Sincronización completada: {exito_count} éxitos, {error_count} errores")
-                    st.success("¡Proceso terminado! Consulta el resumen abajo.")
-                    
-                    # Limpiar datos temporales
-                    del st.session_state.df_actualizar
-                    del st.session_state.df_ml
-                    
-                except Exception as e:
-                    st.error(f"Error durante la sincronización: {str(e)}")
-                    logger.error(f"Error no controlado durante sincronización: {str(e)}")
+                                payload = {"available_quantity": int(all_variations_item['stock_nuevo'].iloc[0])}
+                                logger.info(f"Actualizando {item_id} sin variantes")
+                            
+                            # Actualizar en Mercado Libre
+                            update_result = update_item_stock_safe(item_id, payload, access_token)
+                            if update_result["success"]:
+                                exito_count += len(all_variations_item)
+                                log.append(f"✔️ {item_id}: Actualizado correctamente ({len(all_variations_item)} variantes/items).")
+                            else:
+                                error_count += len(all_variations_item)
+                                error_msg = update_result.get("error", "Error desconocido")
+                                details = update_result.get("details", "")
+                                full_error = f"{error_msg} - {details}" if details else error_msg
+                                log.append(f"❌ {item_id}: Error en actualización. Causa: {full_error}")
+                                errores_tipo.add(error_msg)
+                        
+                        # Pausar publicaciones con stock 0
+                        stock_total_nuevo = st.session_state.df_ml.groupby('item_id')['stock_nuevo'].sum()
+                        items_a_pausar_df = stock_total_nuevo[stock_total_nuevo == 0]
+                        logger.info(f"Pausando {len(items_a_pausar_df)} publicaciones con stock 0")
+                        
+                        for item_id_pausar in items_a_pausar_df.index:
+                            item_original = st.session_state.df_ml[st.session_state.df_ml['item_id'] == item_id_pausar]
+                            if not item_original.empty and item_original['stock'].sum() > 0:
+                                pause_result = pause_item(item_id_pausar, access_token)
+                                if pause_result["success"]:
+                                    log.append(f"⏸️ {item_id_pausar}: Publicación pausada correctamente.")
+                                else:
+                                    error_msg_pause = pause_result.get("error", "Error desconocido")
+                                    log.append(f"❌ {item_id_pausar}: Error al pausar. Causa: {error_msg_pause}")
+                                    errores_tipo.add(f"Error al pausar: {error_msg_pause}")
+                        
+                        # Guardar log
+                        log_filename = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                        log_dir = "logs"
+                        if not os.path.exists(log_dir):
+                            os.makedirs(log_dir)
+                        with open(os.path.join(log_dir, log_filename), "w") as f:
+                            f.write("\n".join(log))
+                        
+                        # Guardar resultado en session_state
+                        st.session_state.resultado = {
+                            "log": log, 
+                            "errores": list(errores_tipo), 
+                            "exito": exito_count, 
+                            "error": error_count, 
+                            "log_file": log_filename
+                        }
+                        
+                        logger.info(f"Sincronización completada: {exito_count} éxitos, {error_count} errores")
+                        st.success("¡Proceso terminado! Consulta el resumen abajo.")
+                        
+                        # Limpiar datos temporales
+                        del st.session_state.df_actualizar
+                        del st.session_state.df_ml
+                        
+                    except Exception as e:
+                        st.error(f"Error durante la sincronización: {str(e)}")
+                        logger.error(f"Error no controlado durante sincronización: {str(e)}")
 
     if "resultado" in st.session_state:
         res = st.session_state.resultado
@@ -826,7 +837,7 @@ elif menu == "Calculadora de Precios":
             output_precios = io.BytesIO()
             with pd.ExcelWriter(output_precios, engine='openpyxl') as writer:
                 df_master.to_excel(writer, index=False)
-            st.download_button("Descargar Catálogo con Precios Calculados", data=output_precios.getvalue(), file_name="catalogo_precios_calculados.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button("Descargar Catálogo with Precios Calculados", data=output_precios.getvalue(), file_name="catalogo_precios_calculados.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else:
             st.error("El archivo maestro no contiene la columna 'PRECIO MAYOREO'. Por favor, verifica el archivo.")
 
@@ -870,26 +881,36 @@ elif menu == "Auditor de Variaciones":
 elif menu == "Historial":
     st.markdown(
         "<h1 style='color:#F39200;'>📂 Historial de Archivos</h1>"
-        "<div style='color:#888;margin-bottom:20px;'>Aquí puedes descargar los últimos 3 archivos de inventario de Mercado Libre y de tu proveedor.</div>",
+        "<div style='color:#888;margin-bottom:20px;'>Aquí puedes descargar los últimos 3 archivos de inventario de Mercado Libre, de tu proveedor y los reportes de variaciones/publicaciones sin SKU.</div>",
         unsafe_allow_html=True
     )
 
-    st.subheader("Historial de Inventarios de Mercado Libre")
-    ml_history_dir = "inventario_ml_historial"
-    if os.path.exists(ml_history_dir):
-        ml_files = sorted(os.listdir(ml_history_dir), reverse=True)
-        for f in ml_files:
-            with open(os.path.join(ml_history_dir, f), "rb") as file:
-                st.download_button(f, file.read(), file_name=f)
-    else:
-        st.info("No hay historial de inventarios de Mercado Libre.")
+    with st.expander("Historial de Inventarios de Mercado Libre", expanded=False):
+        ml_history_dir = "inventario_ml_historial"
+        if os.path.exists(ml_history_dir):
+            ml_files = sorted(os.listdir(ml_history_dir), reverse=True)
+            for f in ml_files:
+                with open(os.path.join(ml_history_dir, f), "rb") as file:
+                    st.download_button(f, file.read(), file_name=f, key=f"ml_{f}")
+        else:
+            st.info("No hay historial de inventarios de Mercado Libre.")
 
-    st.subheader("Historial de Inventarios del Proveedor")
-    prov_history_dir = "inventario_proveedor_historial"
-    if os.path.exists(prov_history_dir):
-        prov_files = sorted(os.listdir(prov_history_dir), reverse=True)
-        for f in prov_files:
-            with open(os.path.join(prov_history_dir, f), "rb") as file:
-                st.download_button(f, file.read(), file_name=f)
-    else:
-        st.info("No hay historial de inventarios del proveedor.")
+    with st.expander("Historial de Inventarios del Proveedor", expanded=False):
+        prov_history_dir = "inventario_proveedor_historial"
+        if os.path.exists(prov_history_dir):
+            prov_files = sorted(os.listdir(prov_history_dir), reverse=True)
+            for f in prov_files:
+                with open(os.path.join(prov_history_dir, f), "rb") as file:
+                    st.download_button(f, file.read(), file_name=f, key=f"prov_{f}")
+        else:
+            st.info("No hay historial de inventarios del proveedor.")
+
+    with st.expander("Historial de reportes de variaciones/publicaciones sin SKU", expanded=False):
+        sin_sku_dir = "sin_sku_historial"
+        if os.path.exists(sin_sku_dir):
+            sin_sku_files = sorted(os.listdir(sin_sku_dir), reverse=True)
+            for f in sin_sku_files:
+                with open(os.path.join(sin_sku_dir, f), "rb") as file:
+                    st.download_button(f, file.read(), file_name=f, key=f"sin_sku_{f}")
+        else:
+            st.info("No hay reportes de variaciones/publicaciones sin SKU.")
