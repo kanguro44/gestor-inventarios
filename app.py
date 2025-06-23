@@ -1,4 +1,3 @@
-e
 import streamlit as st
 import requests
 import json
@@ -830,7 +829,7 @@ elif menu == "Calculadora de Precios":
                 return np.ceil(precio_sugerido) if precio_sugerido >= 299.00 else 299.00
             df_master['PRECIO VENTA SUGERIDO'] = df_master['PRECIO MAYOREO'].apply(calcular_precio_venta)
             st.markdown("---")
-            st.subheader("Catálogo con Precios Calculados")
+            st.subheader("Catálogo with Precios Calculados")
             columnas_a_mostrar = ["CLAVE_ARTICULO", "DESCRIPCION DEL ARTICULO", "PRECIO MAYOREO", "PRECIO VENTA SUGERIDO"]
             columnas_existentes = [col for col in columnas_a_mostrar if col in df_master.columns]
             st.dataframe(df_master[columnas_existentes], use_container_width=True)
