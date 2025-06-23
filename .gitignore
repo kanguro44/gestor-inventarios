@@ -123,3 +123,7 @@ dmypy.json
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Google OAuth
+client_secret_*.json
+ml_token.json

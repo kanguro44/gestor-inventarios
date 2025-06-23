@@ -271,23 +271,26 @@ def get_item_detail(item_id, token):
 
 def extract_sku_from_item(item_or_variation):
     """Extrae el SKU de un item o variación buscando en múltiples campos posibles."""
-    # Primero intentar obtener el SKU del campo principal
+    # 1. seller_custom_field
     sku = item_or_variation.get("seller_custom_field", "")
-    
-    # Si no hay SKU en seller_custom_field, intentar obtenerlo de attribute_combinations
+    # 2. attribute_combinations o attributes
     if not sku:
-        attr_field = "attribute_combinations" if "attribute_combinations" in item_or_variation else "attributes"
-        if attr_field in item_or_variation:
-            for attr in item_or_variation[attr_field]:
-                if attr.get("id") == "SELLER_SKU":
-                    sku = attr.get("value_name", "")
-                    break
-    
-    # Si aún no hay SKU, intentar obtenerlo del campo SKU directo
+        for field in ["attribute_combinations", "attributes"]:
+            if field in item_or_variation:
+                for attr in item_or_variation[field]:
+                    if attr.get("id", "").upper() in ["SELLER_SKU", "SKU"]:
+                        sku = attr.get("value_name", "")
+                        if sku:
+                            break
+            if sku:
+                break
+    # 3. sku directo
     if not sku:
         sku = item_or_variation.get("sku", "")
-        
-    return sku
+    # 4. variation_sku (por si acaso)
+    if not sku:
+        sku = item_or_variation.get("variation_sku", "")
+    return str(sku).strip() if sku else ""
 
 def update_item_stock_safe(item_id, all_variations, token):
     """Actualiza el stock de un item asegurando que se envíen TODAS las variantes para evitar eliminaciones."""
@@ -489,7 +492,6 @@ if menu == "Sincronizar Inventario":
             item = get_item_detail(item_id, token)
             if item:
                 status = item.get("status", "unknown")
-                
                 # Procesar publicación con variaciones
                 if "variations" in item and item["variations"]:
                     for v in item["variations"]:
@@ -515,18 +517,24 @@ if menu == "Sincronizar Inventario":
                     })
         
         if job_state["status"] != "cancelled":
-            # Crear DataFrame con toda la información recolectada
             df_inv = pd.DataFrame(all_items_info)
-            
             # Identificar publicaciones sin SKU
             df_sin_sku = df_inv[df_inv["sku"].apply(lambda x: x is None or str(x).strip() == "")]
             if not df_sin_sku.empty:
                 job_state["sin_sku"] = True
                 job_state["sin_sku_count"] = len(df_sin_sku)
                 job_state["sin_sku_items"] = df_sin_sku[["item_id", "título"]].drop_duplicates().to_dict('records')
+                # Guardar reporte Excel de publicaciones/variaciones sin SKU
+                sin_sku_dir = "reportes_sin_sku"
+                if not os.path.exists(sin_sku_dir):
+                    os.makedirs(sin_sku_dir)
+                reporte_path = os.path.join(sin_sku_dir, f"sin_sku_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+                df_sin_sku.to_excel(reporte_path, index=False)
+                job_state["sin_sku_reporte"] = reporte_path
                 logger.warning(f"Se encontraron {len(df_sin_sku)} variaciones sin SKU en {len(job_state['sin_sku_items'])} publicaciones")
             else:
                 job_state["sin_sku"] = False
+                job_state["sin_sku_reporte"] = None
                 logger.info("No se encontraron publicaciones sin SKU")
             
             # Guardar en session_state y en historial
@@ -576,13 +584,17 @@ if menu == "Sincronizar Inventario":
         if st.session_state.extraction_job.get("sin_sku", False):
             sin_sku_count = st.session_state.extraction_job.get("sin_sku_count", 0)
             sin_sku_items = st.session_state.extraction_job.get("sin_sku_items", [])
-            
             st.warning(f"⚠️ Se encontraron {sin_sku_count} variaciones sin SKU en {len(sin_sku_items)} publicaciones.")
-            
+            if st.session_state.extraction_job.get("sin_sku_reporte"):
+                with open(st.session_state.extraction_job["sin_sku_reporte"], "rb") as f:
+                    st.download_button(
+                        "Descargar reporte de publicaciones sin SKU",
+                        f.read(),
+                        file_name=os.path.basename(st.session_state.extraction_job["sin_sku_reporte"])
+                    )
             with st.expander("Ver publicaciones sin SKU"):
                 for item in sin_sku_items:
                     st.markdown(f"**{item['item_id']}**: {item['título']}")
-                
                 st.markdown("""
                 **Importante:** Las publicaciones sin SKU no podrán ser actualizadas automáticamente.
                 Te recomendamos agregar SKUs a todas tus publicaciones en Mercado Libre.
