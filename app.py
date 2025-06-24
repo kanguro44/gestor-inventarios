@@ -117,9 +117,8 @@ def handle_oauth_callback():
                 st.session_state.user_name = user_info.get("name", email.split("@")[0])
                 # Generar y guardar token de sesión
                 st.session_state.session_token = hashlib.sha256(os.urandom(1024)).hexdigest()
+                st.query_params.clear()
                 st.query_params["session_token"] = st.session_state.session_token
-                # Limpiar parámetros de la URL tras login exitoso
-                st.experimental_set_query_params(session_token=st.session_state.session_token)
                 return True
             else:
                 st.error(f"Acceso denegado. El correo {email} no pertenece al dominio @espaitec.mx")
