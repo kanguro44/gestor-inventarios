@@ -13,6 +13,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 import threading
 import logging
+import pytz
 
 # Configuración de logging
 logging.basicConfig(
@@ -270,7 +271,7 @@ def get_item_detail(item_id, token):
         return None
 
 def extract_sku_from_item(item_or_variation):
-    """Extrae el SKU de un item o variación buscando en múltiples campos posibles, evitando falsos positivos."""
+    """Extrae el SKU de un item o variación buscando en múltiples campos posibles, evitando falsos positivos. Loggea el JSON si no encuentra SKU."""
     # 1. seller_custom_field (preferido, si es string no vacío)
     sku = item_or_variation.get("seller_custom_field", None)
     if isinstance(sku, str) and sku.strip():
@@ -292,6 +293,14 @@ def extract_sku_from_item(item_or_variation):
                 value = attr.get("value_name") or attr.get("value")
                 if isinstance(value, str) and value.strip():
                     return value.strip()
+    # 2b. Buscar cualquier atributo cuyo valor parezca un SKU (alfanumérico, largo típico)
+    for field in attr_fields:
+        for attr in item_or_variation.get(field, []):
+            value = attr.get("value_name") or attr.get("value")
+            if isinstance(value, str) and value.strip():
+                # Heurística: si el valor es alfanumérico y de longitud 5-30
+                if value.strip().isalnum() and 5 <= len(value.strip()) <= 30:
+                    return value.strip()
 
     # 3. sku o variation_sku directo
     for key in ["sku", "variation_sku"]:
@@ -299,7 +308,8 @@ def extract_sku_from_item(item_or_variation):
         if isinstance(value, str) and value.strip():
             return value.strip()
 
-    # 4. No se encontró SKU válido
+    # 4. No se encontró SKU válido: loggear el JSON para análisis
+    logger.warning(f"No se encontró SKU en: {json.dumps(item_or_variation, ensure_ascii=False)[:1000]}")
     return ""
 
 def update_item_stock_safe(item_id, all_variations, token):
@@ -551,13 +561,15 @@ if menu == "Sincronizar Inventario":
                 logger.info("No se encontraron publicaciones sin SKU")
             
             # Guardar en session_state y en historial
+            tz = pytz.timezone("America/Mexico_City")
+            now_mx = datetime.now(tz)
             st.session_state.ml_inventory = df_inv
-            st.session_state.ml_inventory_fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.session_state.ml_inventory_fecha = now_mx.strftime("%Y-%m-%d %H:%M:%S")
             
             # Guardar archivo en historial
             history_dir = "inventario_ml_historial"
             manage_file_history(history_dir, ".xlsx")
-            filename = f"ml_inventory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            filename = f"ml_inventory_{now_mx.strftime('%Y%m%d_%H%M%S')}.xlsx"
             file_path = os.path.join(history_dir, filename)
             df_inv.to_excel(file_path, index=False)
             logger.info(f"Inventario guardado en {file_path} con {len(df_inv)} variantes")
