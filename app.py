@@ -303,23 +303,29 @@ def extract_sku_from_item(item_or_variation):
         logger.debug(f"SKU encontrado en seller_custom_field para {item_id}: {sku.strip()}")
         return sku.strip()
 
-    # 2. Buscar en attributes con más variaciones de nombres
+    # 2. Nuevo: Buscar en el campo "seller_sku" que es donde ML guarda el "Código de identificación (SKU)"
+    sku = item_or_variation.get("seller_sku", None)
+    if isinstance(sku, str) and sku.strip():
+        logger.debug(f"SKU encontrado en seller_sku para {item_id}: {sku.strip()}")
+        return sku.strip()
+
+    # 3. Buscar en attributes con más variaciones de nombres
     if "attributes" in item_or_variation:
         for attr in item_or_variation["attributes"]:
             attr_id = attr.get("id", "").upper()
-            # Buscar múltiples variaciones de SKU
-            if attr_id in ["SELLER_SKU", "SKU", "ITEM_SKU", "PRODUCT_SKU", "CUSTOM_SKU"]:
+            # Buscar múltiples variaciones de SKU incluyendo SELLER_SKU que es el campo oficial
+            if attr_id in ["SELLER_SKU", "SKU", "ITEM_SKU", "PRODUCT_SKU", "CUSTOM_SKU", "IDENTIFIER"]:
                 # Probar diferentes campos de valor
                 for value_field in ["value_name", "value", "values"]:
                     value = attr.get(value_field)
                     if isinstance(value, str) and value.strip():
-                        logger.debug(f"SKU encontrado en attributes.{value_field} para {item_id}: {value.strip()}")
+                        logger.debug(f"SKU encontrado en attributes.{attr_id}.{value_field} para {item_id}: {value.strip()}")
                         return value.strip()
                     elif isinstance(value, list) and value and isinstance(value[0], str):
-                        logger.debug(f"SKU encontrado en attributes.{value_field}[0] para {item_id}: {value[0].strip()}")
+                        logger.debug(f"SKU encontrado en attributes.{attr_id}.{value_field}[0] para {item_id}: {value[0].strip()}")
                         return value[0].strip()
 
-    # 3. Buscar en attribute_combinations (para variaciones)
+    # 4. Buscar en attribute_combinations (para variaciones)
     if "attribute_combinations" in item_or_variation:
         for attr in item_or_variation["attribute_combinations"]:
             attr_id = attr.get("id", "").upper()
@@ -327,20 +333,25 @@ def extract_sku_from_item(item_or_variation):
                 for value_field in ["value_name", "value", "values"]:
                     value = attr.get(value_field)
                     if isinstance(value, str) and value.strip():
-                        logger.debug(f"SKU encontrado en attribute_combinations.{value_field} para {item_id}: {value.strip()}")
+                        logger.debug(f"SKU encontrado en attribute_combinations.{attr_id}.{value_field} para {item_id}: {value.strip()}")
                         return value.strip()
 
-    # 4. Campos directos de SKU
-    for key in ["sku", "variation_sku", "seller_sku", "custom_sku"]:
+    # 5. Campos directos de SKU (ampliados)
+    for key in ["sku", "variation_sku", "seller_sku", "custom_sku", "identifier", "code"]:
         value = item_or_variation.get(key, None)
         if isinstance(value, str) and value.strip():
             logger.debug(f"SKU encontrado en campo directo {key} para {item_id}: {value.strip()}")
             return value.strip()
 
-    # 5. Si no se encuentra, log para debugging
+    # 6. Si no se encuentra, log para debugging con más detalle
     logger.warning(f"No se encontró SKU para item {item_id}. Estructura disponible: {list(item_or_variation.keys())}")
     
-    # 6. Último recurso: buscar cualquier campo que contenga "sku" en el nombre
+    # Log específico de atributos para debug
+    if "attributes" in item_or_variation:
+        attr_list = [f"{attr.get('id', 'NO_ID')}:{attr.get('value_name', attr.get('value', 'NO_VALUE'))}" for attr in item_or_variation["attributes"]]
+        logger.warning(f"Atributos disponibles en {item_id}: {attr_list}")
+    
+    # 7. Último recurso: buscar cualquier campo que contenga "sku" en el nombre
     for key, value in item_or_variation.items():
         if "sku" in key.lower() and isinstance(value, str) and value.strip():
             logger.debug(f"SKU encontrado en campo alternativo {key} para {item_id}: {value.strip()}")
@@ -569,7 +580,7 @@ if menu == "Sincronizar Inventario":
                             # Debug adicional para variaciones sin SKU en publicaciones problemáticas
                             if not sku and item_id in ["MLM1338123694", "MLM1339305557", "MLM1339298925", "MLM1339298922", "MLM1856162519", "MLM2308903050", "MLM3088252038"]:
                                 logger.warning(f"DEBUG: Variación sin SKU en {item_id}, variation_id: {v.get('id')}")
-                                print(f"Estructura de variación sin SKU: {v}")
+                                logger.warning(f"Estructura de variación sin SKU: keys={list(v.keys())}, seller_custom_field={v.get('seller_custom_field')}, seller_sku={v.get('seller_sku')}")
                             
                             all_items_info.append({
                                 "status": status, 
@@ -589,7 +600,7 @@ if menu == "Sincronizar Inventario":
                         # Debug adicional para publicaciones sin SKU
                         if not sku and item_id in ["MLM1338123694", "MLM1339305557", "MLM1339298925", "MLM1339298922", "MLM1856162519", "MLM2308903050", "MLM3088252038"]:
                             logger.warning(f"DEBUG: Publicación sin SKU {item_id}")
-                            print(f"Estructura de publicación sin SKU: {item}")
+                            logger.warning(f"Estructura de publicación sin SKU: keys={list(item.keys())}, seller_custom_field={item.get('seller_custom_field')}, seller_sku={item.get('seller_sku')}")
                         
                         all_items_info.append({
                             "status": status, 
@@ -670,6 +681,20 @@ if menu == "Sincronizar Inventario":
         progress = st.session_state.extraction_job.get("progress", 0)
         text = st.session_state.extraction_job.get("text", "")
         st.progress(progress, text=text)
+        
+        # Mostrar logs de debugging en tiempo real
+        if os.path.exists("app.log"):
+            with st.expander("📋 Ver logs de debugging en tiempo real", expanded=False):
+                try:
+                    with open("app.log", "r") as f:
+                        # Leer las últimas 50 líneas del log
+                        lines = f.readlines()
+                        recent_lines = lines[-50:] if len(lines) > 50 else lines
+                        log_content = "".join(recent_lines)
+                        st.text_area("Logs recientes:", value=log_content, height=200, disabled=True)
+                except Exception:
+                    st.text("No se pueden cargar los logs en este momento")
+        
         time.sleep(1)
         st.rerun()
     
@@ -998,25 +1023,32 @@ def debug_item_structure(item_id, token):
         resp.raise_for_status()
         item = resp.json()
         
-        print(f"\n=== DEBUG ITEM {item_id} ===")
-        print(f"Título: {item.get('title', 'N/A')}")
-        print(f"seller_custom_field: {item.get('seller_custom_field', 'N/A')}")
+        logger.info(f"\n=== DEBUG ITEM {item_id} ===")
+        logger.info(f"Título: {item.get('title', 'N/A')}")
+        logger.info(f"seller_custom_field: {item.get('seller_custom_field', 'N/A')}")
+        logger.info(f"seller_sku: {item.get('seller_sku', 'N/A')}")
         
         if "attributes" in item:
-            print("Attributes:")
+            logger.info("Attributes:")
             for attr in item["attributes"]:
-                print(f"  - {attr.get('id')}: {attr.get('value_name', attr.get('value', 'N/A'))}")
+                attr_id = attr.get('id', 'NO_ID')
+                attr_value = attr.get('value_name', attr.get('value', 'NO_VALUE'))
+                logger.info(f"  - {attr_id}: {attr_value}")
         
         if "variations" in item and item["variations"]:
-            print("Variations:")
+            logger.info("Variations:")
             for i, var in enumerate(item["variations"]):
-                print(f"  Variation {i}:")
-                print(f"    - seller_custom_field: {var.get('seller_custom_field', 'N/A')}")
+                logger.info(f"  Variation {i}:")
+                logger.info(f"    - id: {var.get('id', 'N/A')}")
+                logger.info(f"    - seller_custom_field: {var.get('seller_custom_field', 'N/A')}")
+                logger.info(f"    - seller_sku: {var.get('seller_sku', 'N/A')}")
                 if "attributes" in var:
                     for attr in var["attributes"]:
-                        print(f"    - {attr.get('id')}: {attr.get('value_name', attr.get('value', 'N/A'))}")
+                        attr_id = attr.get('id', 'NO_ID')
+                        attr_value = attr.get('value_name', attr.get('value', 'NO_VALUE'))
+                        logger.info(f"    - {attr_id}: {attr_value}")
         
         return item
     except Exception as e:
-        print(f"Error debugging item {item_id}: {e}")
+        logger.error(f"Error debugging item {item_id}: {e}")
         return None
