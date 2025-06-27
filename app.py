@@ -16,7 +16,7 @@ import logging
 
 # Configuración de logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("app.log"),
@@ -270,29 +270,60 @@ def get_item_detail(item_id, token):
         return None
 
 def extract_sku_from_item(item_or_variation):
-    """Extrae el SKU de un item o variación SOLO de los campos correctos según la documentación de Mercado Libre."""
-    # 1. seller_custom_field (preferido, si es string no vacío)
+    """Extrae el SKU de un item o variación de forma más robusta."""
+    
+    # Debug: Log la estructura del item para identificar problemas
+    item_id = item_or_variation.get("item_id", item_or_variation.get("id", "unknown"))
+    
+    # 1. seller_custom_field (preferido)
     sku = item_or_variation.get("seller_custom_field", None)
     if isinstance(sku, str) and sku.strip():
+        logger.debug(f"SKU encontrado en seller_custom_field para {item_id}: {sku.strip()}")
         return sku.strip()
 
-    # 2. attribute_combinations y attributes: SOLO id SELLER_SKU o SKU
-    for field in ["attribute_combinations", "attributes"]:
-        if field in item_or_variation:
-            for attr in item_or_variation[field]:
-                attr_id = attr.get("id", "").upper()
-                if attr_id in ["SELLER_SKU", "SKU"]:
-                    value = attr.get("value_name") or attr.get("value")
+    # 2. Buscar en attributes con más variaciones de nombres
+    if "attributes" in item_or_variation:
+        for attr in item_or_variation["attributes"]:
+            attr_id = attr.get("id", "").upper()
+            # Buscar múltiples variaciones de SKU
+            if attr_id in ["SELLER_SKU", "SKU", "ITEM_SKU", "PRODUCT_SKU", "CUSTOM_SKU"]:
+                # Probar diferentes campos de valor
+                for value_field in ["value_name", "value", "values"]:
+                    value = attr.get(value_field)
                     if isinstance(value, str) and value.strip():
+                        logger.debug(f"SKU encontrado en attributes.{value_field} para {item_id}: {value.strip()}")
+                        return value.strip()
+                    elif isinstance(value, list) and value and isinstance(value[0], str):
+                        logger.debug(f"SKU encontrado en attributes.{value_field}[0] para {item_id}: {value[0].strip()}")
+                        return value[0].strip()
+
+    # 3. Buscar en attribute_combinations (para variaciones)
+    if "attribute_combinations" in item_or_variation:
+        for attr in item_or_variation["attribute_combinations"]:
+            attr_id = attr.get("id", "").upper()
+            if attr_id in ["SELLER_SKU", "SKU", "ITEM_SKU", "PRODUCT_SKU"]:
+                for value_field in ["value_name", "value", "values"]:
+                    value = attr.get(value_field)
+                    if isinstance(value, str) and value.strip():
+                        logger.debug(f"SKU encontrado en attribute_combinations.{value_field} para {item_id}: {value.strip()}")
                         return value.strip()
 
-    # 3. sku o variation_sku directo
-    for key in ["sku", "variation_sku"]:
+    # 4. Campos directos de SKU
+    for key in ["sku", "variation_sku", "seller_sku", "custom_sku"]:
         value = item_or_variation.get(key, None)
         if isinstance(value, str) and value.strip():
+            logger.debug(f"SKU encontrado en campo directo {key} para {item_id}: {value.strip()}")
             return value.strip()
 
-    # 4. No se encontró SKU válido
+    # 5. Si no se encuentra, log para debugging
+    logger.warning(f"No se encontró SKU para item {item_id}. Estructura disponible: {list(item_or_variation.keys())}")
+    
+    # 6. Último recurso: buscar cualquier campo que contenga "sku" en el nombre
+    for key, value in item_or_variation.items():
+        if "sku" in key.lower() and isinstance(value, str) and value.strip():
+            logger.debug(f"SKU encontrado en campo alternativo {key} para {item_id}: {value.strip()}")
+            return value.strip()
+    
     return ""
 
 def update_item_stock_safe(item_id, all_variations, token):
@@ -495,10 +526,21 @@ if menu == "Sincronizar Inventario":
             item = get_item_detail(item_id, token)
             if item:
                 status = item.get("status", "unknown")
+                
+                # Debug específico para publicaciones problemáticas
+                if item_id in ["MLM1338123694", "MLM1339305557", "MLM1339298925", "MLM1339298922", "MLM1856162519", "MLM2308903050", "MLM3088252038"]:
+                    logger.info(f"DEBUG: Analizando publicación problemática {item_id}")
+                    debug_item_structure(item_id, token)
+                
                 # Procesar publicación con variaciones
                 if "variations" in item and item["variations"]:
                     for v in item["variations"]:
                         sku = extract_sku_from_item(v)
+                        # Debug adicional para variaciones sin SKU en publicaciones problemáticas
+                        if not sku and item_id in ["MLM1338123694", "MLM1339305557", "MLM1339298925", "MLM1339298922", "MLM1856162519", "MLM2308903050", "MLM3088252038"]:
+                            logger.warning(f"DEBUG: Variación sin SKU en {item_id}, variation_id: {v.get('id')}")
+                            print(f"Estructura de variación sin SKU: {v}")
+                        
                         all_items_info.append({
                             "status": status, 
                             "item_id": item_id, 
@@ -510,6 +552,11 @@ if menu == "Sincronizar Inventario":
                 # Procesar publicación sin variaciones
                 else:
                     sku = extract_sku_from_item(item)
+                    # Debug adicional para publicaciones sin SKU
+                    if not sku and item_id in ["MLM1338123694", "MLM1339305557", "MLM1339298925", "MLM1339298922", "MLM1856162519", "MLM2308903050", "MLM3088252038"]:
+                        logger.warning(f"DEBUG: Publicación sin SKU {item_id}")
+                        print(f"Estructura de publicación sin SKU: {item}")
+                    
                     all_items_info.append({
                         "status": status, 
                         "item_id": item_id, 
@@ -896,3 +943,34 @@ elif menu == "Historial":
                 st.download_button(f, file.read(), file_name=f)
     else:
         st.info("No hay historial de inventarios del proveedor.")
+
+def debug_item_structure(item_id, token):
+    """Función temporal para debuggear la estructura de un item específico."""
+    url = f"https://api.mercadolibre.com/items/{item_id}"
+    try:
+        resp = requests.get(url, headers=get_headers(token), timeout=10)
+        resp.raise_for_status()
+        item = resp.json()
+        
+        print(f"\n=== DEBUG ITEM {item_id} ===")
+        print(f"Título: {item.get('title', 'N/A')}")
+        print(f"seller_custom_field: {item.get('seller_custom_field', 'N/A')}")
+        
+        if "attributes" in item:
+            print("Attributes:")
+            for attr in item["attributes"]:
+                print(f"  - {attr.get('id')}: {attr.get('value_name', attr.get('value', 'N/A'))}")
+        
+        if "variations" in item and item["variations"]:
+            print("Variations:")
+            for i, var in enumerate(item["variations"]):
+                print(f"  Variation {i}:")
+                print(f"    - seller_custom_field: {var.get('seller_custom_field', 'N/A')}")
+                if "attributes" in var:
+                    for attr in var["attributes"]:
+                        print(f"    - {attr.get('id')}: {attr.get('value_name', attr.get('value', 'N/A'))}")
+        
+        return item
+    except Exception as e:
+        print(f"Error debugging item {item_id}: {e}")
+        return None
