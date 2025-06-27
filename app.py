@@ -259,15 +259,37 @@ def get_items(user_id, token, status):
     return items
 
 def get_item_detail(item_id, token):
-    """Obtiene los detalles completos de un item específico."""
+    """Obtiene los detalles completos de un item específico con manejo robusto de errores."""
     url = f"https://api.mercadolibre.com/items/{item_id}"
-    try:
-        resp = requests.get(url, headers=get_headers(token), timeout=10)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.RequestException as e:
-        logger.error(f"Error al obtener detalles del item {item_id}: {str(e)}")
-        return None
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, headers=get_headers(token), timeout=15)  # Timeout aumentado
+            
+            # Si hay rate limiting, esperar y reintentar
+            if resp.status_code == 429:
+                wait_time = 2 ** attempt  # Backoff exponencial
+                logger.warning(f"Rate limit para {item_id}, esperando {wait_time}s (intento {attempt + 1}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+                
+            resp.raise_for_status()
+            return resp.json()
+            
+        except requests.Timeout:
+            logger.warning(f"Timeout para {item_id} (intento {attempt + 1}/{max_retries})")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+        except requests.RequestException as e:
+            logger.error(f"Error al obtener detalles del item {item_id} (intento {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+    
+    logger.error(f"Falló completamente la obtención de {item_id} después de {max_retries} intentos")
+    return None
 
 def extract_sku_from_item(item_or_variation):
     """Extrae el SKU de un item o variación de forma más robusta."""
@@ -522,49 +544,73 @@ if menu == "Sincronizar Inventario":
             job_state["progress"] = (idx + 1) / total_publicaciones
             job_state["text"] = f"Descargando {idx+1}/{total_publicaciones}"
 
-            # Obtener detalles de la publicación
-            item = get_item_detail(item_id, token)
-            if item:
+            # Obtener detalles de la publicación con manejo de errores robusto
+            try:
+                item = get_item_detail(item_id, token)
+                if not item:
+                    logger.warning(f"No se pudo obtener detalles para {item_id}, saltando...")
+                    continue
+                    
                 status = item.get("status", "unknown")
                 
                 # Debug específico para publicaciones problemáticas
                 if item_id in ["MLM1338123694", "MLM1339305557", "MLM1339298925", "MLM1339298922", "MLM1856162519", "MLM2308903050", "MLM3088252038"]:
                     logger.info(f"DEBUG: Analizando publicación problemática {item_id}")
-                    debug_item_structure(item_id, token)
+                    try:
+                        debug_item_structure(item_id, token)
+                    except Exception as debug_error:
+                        logger.error(f"Error en debug de {item_id}: {debug_error}")
                 
                 # Procesar publicación con variaciones
                 if "variations" in item and item["variations"]:
                     for v in item["variations"]:
-                        sku = extract_sku_from_item(v)
-                        # Debug adicional para variaciones sin SKU en publicaciones problemáticas
+                        try:
+                            sku = extract_sku_from_item(v)
+                            # Debug adicional para variaciones sin SKU en publicaciones problemáticas
+                            if not sku and item_id in ["MLM1338123694", "MLM1339305557", "MLM1339298925", "MLM1339298922", "MLM1856162519", "MLM2308903050", "MLM3088252038"]:
+                                logger.warning(f"DEBUG: Variación sin SKU en {item_id}, variation_id: {v.get('id')}")
+                                print(f"Estructura de variación sin SKU: {v}")
+                            
+                            all_items_info.append({
+                                "status": status, 
+                                "item_id": item_id, 
+                                "título": item.get("title", ""),
+                                "sku": sku, 
+                                "variación_id": v.get("id", np.nan),
+                                "stock": v.get("available_quantity", 0),
+                            })
+                        except Exception as var_error:
+                            logger.error(f"Error procesando variación de {item_id}: {var_error}")
+                            continue
+                # Procesar publicación sin variaciones
+                else:
+                    try:
+                        sku = extract_sku_from_item(item)
+                        # Debug adicional para publicaciones sin SKU
                         if not sku and item_id in ["MLM1338123694", "MLM1339305557", "MLM1339298925", "MLM1339298922", "MLM1856162519", "MLM2308903050", "MLM3088252038"]:
-                            logger.warning(f"DEBUG: Variación sin SKU en {item_id}, variation_id: {v.get('id')}")
-                            print(f"Estructura de variación sin SKU: {v}")
+                            logger.warning(f"DEBUG: Publicación sin SKU {item_id}")
+                            print(f"Estructura de publicación sin SKU: {item}")
                         
                         all_items_info.append({
                             "status": status, 
                             "item_id": item_id, 
                             "título": item.get("title", ""),
                             "sku": sku, 
-                            "variación_id": v.get("id", np.nan),
-                            "stock": v.get("available_quantity", 0),
+                            "variación_id": np.nan,
+                            "stock": item.get("available_quantity", 0),
                         })
-                # Procesar publicación sin variaciones
-                else:
-                    sku = extract_sku_from_item(item)
-                    # Debug adicional para publicaciones sin SKU
-                    if not sku and item_id in ["MLM1338123694", "MLM1339305557", "MLM1339298925", "MLM1339298922", "MLM1856162519", "MLM2308903050", "MLM3088252038"]:
-                        logger.warning(f"DEBUG: Publicación sin SKU {item_id}")
-                        print(f"Estructura de publicación sin SKU: {item}")
+                    except Exception as item_error:
+                        logger.error(f"Error procesando item {item_id}: {item_error}")
+                        continue
+                        
+                # Pequeña pausa para evitar rate limiting
+                if idx % 50 == 0:  # Cada 50 publicaciones
+                    time.sleep(0.5)
                     
-                    all_items_info.append({
-                        "status": status, 
-                        "item_id": item_id, 
-                        "título": item.get("title", ""),
-                        "sku": sku, 
-                        "variación_id": np.nan,
-                        "stock": item.get("available_quantity", 0),
-                    })
+            except Exception as general_error:
+                logger.error(f"Error general procesando {item_id}: {general_error}")
+                # Continuar con el siguiente item en lugar de fallar completamente
+                continue
         
         if job_state["status"] != "cancelled":
             df_inv = pd.DataFrame(all_items_info)
